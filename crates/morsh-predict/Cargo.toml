@@ -1,0 +1,10 @@
+[package]
+name = "morsh-predict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+morsh-core.workspace = true
+thiserror.workspace = true

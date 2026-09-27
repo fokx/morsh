@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/morsh-core",
+    "crates/morsh-transport",
+    "crates/morsh-auth",
+    "crates/morsh-term",
+    "crates/morsh-predict",
+    "crates/morsh-tunnel",
+    "crates/morshd",
+    "crates/morsh",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["morsh contributors"]
+
+[workspace.dependencies]
+# Internal workspace crates
+morsh-core = { path = "crates/morsh-core" }
+morsh-transport = { path = "crates/morsh-transport" }
+morsh-auth = { path = "crates/morsh-auth" }
+morsh-term = { path = "crates/morsh-term" }
+morsh-predict = { path = "crates/morsh-predict" }
+morsh-tunnel = { path = "crates/morsh-tunnel" }
+
+# External async / networking dependencies
+tokio = { version = "1.43", features = ["full"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2.2"
+rcgen = "0.14"
+ring = "0.17"
+
+# Serialization & wire framing
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }
+bytes = "1.10"
+
+# CLI & Observability
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+anyhow = "1.0"

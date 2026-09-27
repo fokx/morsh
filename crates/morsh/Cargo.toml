@@ -1,0 +1,19 @@
+[package]
+name = "morsh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "morsh"
+path = "src/main.rs"
+
+[dependencies]
+morsh-core.workspace = true
+morsh-transport.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
