@@ -100,3 +100,17 @@ pub fn generate_session_id() -> [u8; 16] {
         .expect("Failed to generate random session ID");
     id
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_session_id_uniqueness() {
+        let id1 = generate_session_id();
+        let id2 = generate_session_id();
+        assert_ne!(id1, [0u8; 16]);
+        assert_ne!(id2, [0u8; 16]);
+        assert_ne!(id1, id2);
+    }
+}

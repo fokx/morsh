@@ -132,3 +132,29 @@ pub fn make_client_config(insecure: bool) -> Result<ClientConfig> {
 
     Ok(client_config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_self_signed_cert_and_fingerprint() {
+        let (certs, _key) = generate_self_signed_cert(vec!["localhost".into()]).unwrap();
+        assert!(!certs.is_empty());
+
+        let fingerprint = cert_fingerprint_sha256(&certs[0]);
+        // SHA-256 fingerprint: 32 hex bytes separated by ':' -> 32*2 + 31 = 95 chars
+        assert_eq!(fingerprint.len(), 95);
+        assert_eq!(fingerprint.matches(':').count(), 31);
+    }
+
+    #[test]
+    fn test_configs_construct_with_alpn() {
+        let (certs, key) = generate_self_signed_cert(vec!["127.0.0.1".into()]).unwrap();
+        let server_cfg = make_server_config(certs, key);
+        assert!(server_cfg.is_ok());
+
+        let client_cfg = make_client_config(true);
+        assert!(client_cfg.is_ok());
+    }
+}

@@ -60,7 +60,12 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     }
 
     let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
+    if let Err(e) = reader.read_exact(&mut payload).await {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(CoreError::UnexpectedEof);
+        }
+        return Err(CoreError::Io(e));
+    }
     decode_payload(&payload)
 }
 
@@ -105,5 +110,68 @@ mod tests {
         let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
 
         assert_eq!(original, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_ping_pong_disconnect_roundtrip() {
+        let ping = ControlMessage::Ping {
+            seq: 100,
+            timestamp_ms: 1700000000000,
+        };
+        let pong = ControlMessage::Pong {
+            seq: 100,
+            echo_timestamp_ms: 1700000000000,
+        };
+        let disconnect = ControlMessage::Disconnect {
+            reason_code: 0,
+            message: "user logout".into(),
+        };
+
+        for msg in [ping, pong, disconnect] {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &msg).await.unwrap();
+            let mut reader = Cursor::new(buffer);
+            let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_frame_too_large_rejected() {
+        // Construct a frame header indicating size > MAX_FRAME_SIZE
+        let excessive_len = (MAX_FRAME_SIZE + 1) as u32;
+        let mut buffer = excessive_len.to_be_bytes().to_vec();
+        buffer.extend_from_slice(&[0u8; 16]);
+
+        let mut reader = Cursor::new(buffer);
+        let result: Result<ControlMessage> = read_frame(&mut reader).await;
+
+        assert!(matches!(result, Err(CoreError::FrameTooLarge { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_unexpected_eof_on_empty_or_truncated_stream() {
+        // Completely empty
+        let mut empty_reader = Cursor::new(Vec::new());
+        let res_empty: Result<ControlMessage> = read_frame(&mut empty_reader).await;
+        assert!(matches!(res_empty, Err(CoreError::UnexpectedEof)));
+
+        // Truncated header (only 2 bytes instead of 4)
+        let mut truncated_header = Cursor::new(vec![0, 0]);
+        let res_hdr: Result<ControlMessage> = read_frame(&mut truncated_header).await;
+        assert!(matches!(res_hdr, Err(CoreError::UnexpectedEof)));
+
+        // Header says 10 bytes, but only 3 bytes present
+        let mut truncated_payload = Cursor::new(vec![0, 0, 0, 10, 1, 2, 3]);
+        let res_payload: Result<ControlMessage> = read_frame(&mut truncated_payload).await;
+        assert!(matches!(res_payload, Err(CoreError::UnexpectedEof)));
+    }
+
+    #[tokio::test]
+    async fn test_corrupted_payload_returns_deserialization_error() {
+        let corrupt_data = vec![0, 0, 0, 4, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut reader = Cursor::new(corrupt_data);
+        let result: Result<ControlMessage> = read_frame(&mut reader).await;
+        assert!(matches!(result, Err(CoreError::Deserialization(_))));
     }
 }

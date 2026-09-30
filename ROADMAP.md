@@ -1,200 +1,154 @@
-# morsh: Project Architecture & Phased Roadmap
+# morsh: Architectural Blueprint & Phased Roadmap
 
-`morsh` is a next-generation SSH replacement written in Rust, combining the best properties of:
-1. **Mosh**: Resilient sessions across sleeping/waking devices, network drops, IP roaming, terminal state synchronization, and a predictive local echo engine for ultra-low typing latency.
-2. **SSH3**: QUIC + TLS 1.3 transport, secret-path / port-knocking defense against port scanners, HTTP-style authentication semantics, UDP port forwarding, and automatic TCP fallback.
+> **IMPORTANT ARCHITECTURAL INVARIANT**:
+> **`ROADMAP.md` IS IMMUTABLE**. This document defines the permanent, authoritative architectural design, protocol specifications, crate structure, and phase objectives for `morsh`.
+> **DO NOT** edit this file to track execution progress, toggle checkmarks, or record implementation logs.
+> **ALL execution updates, task completions, and handoff instructions MUST be recorded in [`PROGRESS.md`](PROGRESS.md)**.
 
 ---
 
-Here is the comprehensive architectural blueprint and phased implementation plan for morsh (client) and morshd (server daemon).
+## 1. Executive Summary & Design Vision
 
-1. Architectural Vision
-   morsh synthesizes the strengths of Mosh (session durability, connection roaming, predictive local echo) and SSH3 (QUIC + TLS 1.3, stealth/port-scan defense, HTTP authorization semantics, UDP forwarding, TCP fallback) into a single, memory-safe Rust codebase.
+`morsh` is a next-generation terminal and multiplexing protocol written in pure Rust. It combines the strongest architectural innovations of **Mosh** and **SSH3**:
 
-
-
+```
 +-----------------------------------------------------------------------------------+
-|                                     morsh (Client)                                |
-|  +--------------------+  +-----------------------+  +--------------------------+  |
-|  | Predictive Engine  |  |  Screen State Buffer  |  |   Terminal Input/Output  |  |
-|  |  (speculative echo)|  |     (vt100 / diff)    |  |       (crossterm)        |  |
-|  +---------+----------+  +-----------+-----------+  +------------+-------------+  |
-+------------|-------------------------|---------------------------|----------------+
-|                         |                           |
-| QUIC Multiplexed Channels:                          |
-| - Control / Auth / Knocking (Stream 0)              |
-| - Terminal State Sync / Stream (Stream 1 / Datagram)|
-| - Port Forwarding (TCP/UDP streams & datagrams)     |
-v                         v                           v
+|                                  morsh (Client CLI)                               |
+|  +---------------------+  +-----------------------+  +-------------------------+  |
+|  |  Predictive Engine  |  |  Screen State Buffer  |  |  Terminal I/O (Raw Mode)|  |
+|  |  (speculative echo) |  |     (vt100 / diff)    |  |       (crossterm)       |  |
+|  +----------+----------+  +-----------+-----------+  +------------+------------+  |
++-------------|-------------------------|---------------------------|---------------+
+              |                         |                           |
+              | QUIC Multiplexed Channels:                          |
+              | - Stream 0: Control, Auth & Stealth Knocking        |
+              | - Stream 1..N: Interactive PTY & Command Channels   |
+              | - Stream / Datagram: State Sync & Realtime Diffs    |
+              | - Stream / Datagram: TCP / UDP Port Forwardings     |
+              v                         v                           v
 +-----------------------------------------------------------------------------------+
-|                      Transport Layer (QUIC / TLS 1.3 + TCP Fallback)              |
-|  - Connection Migration (Seamless IP roaming via Connection IDs)                  |
-|  - Stealth Masking (Secret URL path / Port Knocking)                              |
+|                   Transport Layer (QUIC / TLS 1.3 + TCP Fallback)                 |
+|  - Connection Migration: Seamless IP/Interface roaming via Connection IDs (CID)   |
+|  - Stealth Masking: Secret Knock / Subpath (Silent Drops / Fake HTTP 404)         |
+|  - Unreliable Datagrams (RFC 9221) for realtime screen updates                    |
 +-----------------------------------------------------------------------------------+
-^                         ^                           ^
-|                         |                           |
-+------------|-------------------------|---------------------------|----------------+
-|  +---------+----------+  +-----------+-----------+  +------------+-------------+  |
-|  | Auth & Secret Knock|  | Session Persistence   |  |   PTY Process Supervisor |  |
-|  | (SSH Keys/PAM/OIDC)|  | (Detached Shell State)|  |   (portable-pty / nix)   |  |
-|  +--------------------+  +-----------------------+  +--------------------------+  |
-|                                    morshd (Server)                                |
+              ^                         ^                           ^
+              |                         |                           |
++-------------|-------------------------|---------------------------|---------------+
+|  +----------+----------+  +-----------+-----------+  +------------+------------+  |
+|  | Auth & Secret Knock |  |  Session Supervisor   |  | PTY Process Supervisor  |  |
+|  | (SSH Keys, PAM, OIDC|  |  (Detached PTY State) |  |   (portable-pty / nix)  |  |
+|  +---------------------+  +-----------------------+  +-------------------------+  |
+|                                 morshd (Server Daemon)                            |
 +-----------------------------------------------------------------------------------+
-2. Key Pillars & Technical Strategy
-   Pillar A: QUIC Transport, Roaming & TCP Fallback (SSH3 & Mosh)
-   QUIC over UDP (quinn + rustls):
-   Full TLS 1.3 encryption with 0-RTT session resumption.
-   Connection Migration: QUIC’s Connection IDs (CIDs) allow clients to switch from Wi-Fi to cellular or Ethernet without dropping the transport connection.
-   Independent multiplexed streams avoid Head-of-Line (HoL) blocking between terminal output, keystrokes, and port forwarding.
-   Stealth Mode (Anti-Port-Scanning):
-   Like SSH3, the server can operate behind an HTTP/3 ALPN or custom QUIC ALPN.
-   Unauthenticated or non-matching probe packets (scanning tools like Nmap or Shodan) receive generic HTTP 404 responses or silent packet drops.
-   Access requires a secret pre-auth knocking path or signed token.
-   TCP Fallback:
-   If UDP is blocked by a corporate firewall, client runs a fast fallback (Happy Eyeballs style) to TLS 1.3 over TCP.
-   Pillar B: Session Persistence & Resumption (Mosh)
-   Detached Session Server:
-   Traditional SSH ties the shell lifecycle directly to the TCP socket. When TCP drops, SIGHUP terminates the shell.
-   morshd separates the Session Controller from the Network Connection:
-   The shell PTY remains running in the background even if the network is disconnected for hours or the laptop sleeps.
-   Sessions have cryptographic session tokens. Reconnecting clients present their session token and reattach seamlessly.
-   Screen State Sync vs. Raw Byte Streams:
-   For interactive sessions, morshd maintains a virtual terminal emulator state (via vt100).
-   When reattaching, the server sends the current screen state snapshot rather than replaying megabytes of raw terminal history.
-   Pillar C: Predictive Local Echo Engine (Mosh)
-   Speculative Keystroke Prediction:
-   On high-latency links (cellular, satellite), waiting for server round-trips makes typing painful.
-   Client speculatively displays printable characters, cursor movements (left/right arrows), and backspaces immediately.
-   Speculative output is visually distinguished (e.g., subtle underline).
-   Confidence Heuristics & 1-RTT Divergence Rollback:
-   Tracks server sequence numbers. When the server confirms the frame, underlines disappear.
-   If the server output diverges (e.g., password input with echo off, tab completion, syntax highlighting, or vim screen refresh), the client rolls back speculative changes within 1 RTT.
-   Pillar D: Forwarding & Multiplexing
-   TCP Port Forwarding (-L, -R) & SOCKS5 Dynamic Proxy (-D): Each forwarded connection maps to a lightweight QUIC stream.
-   UDP Port Forwarding: Supported natively over QUIC Datagrams (RFC 9221) or multiplexed streams.
-3. Workspace Crate Architecture
-   To ensure separation of concerns and maintainability, the project will be structured as a Cargo workspace:
+```
 
+### Core Value Propositions
+1. **Survives Network Drops and Sleep (Mosh)**: Laptops can sleep for hours or drop connection; the server retains the shell session and virtual terminal state.
+2. **Seamless IP Roaming (Mosh / QUIC Native)**: Dynamic handover between Wi-Fi, cellular, and wired interfaces using QUIC Connection IDs (CID) without session resets.
+3. **Sub-millisecond Typing Latency (Mosh)**: Speculative local echo engine predicts printable characters, cursor movements, and backspaces with automatic 1-RTT rollback on misprediction.
+4. **Stealth & Anti-Port-Scanning (SSH3)**: Secret pre-auth knocking paths make the server invisible to port scanners (e.g. Nmap, Shodan) by responding with HTTP 404 or dropping packets.
+5. **Modern Security & Faster Handshake (SSH3)**: Pure TLS 1.3 encryption with 0-RTT/1-RTT connection setup over QUIC/UDP.
+6. **UDP + TCP Port Forwarding (SSH3)**: First-class UDP port forwarding alongside classic TCP forwarding and SOCKS5 dynamic proxying.
+7. **Resilient TCP Fallback**: Automatic fallback to TLS 1.3 over TCP in restrictive corporate firewalls that block UDP.
 
+---
 
+## 2. Workspace Crate Architecture
+
+The codebase is structured as a Cargo workspace with strict module boundaries:
+
+```
 morsh/
-├── Cargo.toml                  # Workspace root
-├── crates/
-│   ├── morsh-core/             # Protocol frames, wire formats, config, shared errors
-│   ├── morsh-transport/        # QUIC (Quinn), TLS 1.3, TCP fallback, connection migration
-│   ├── morsh-auth/             # SSH key auth, SSH-agent, PAM, secret knock verification
-│   ├── morsh-term/             # PTY supervisor (portable-pty/nix), vt100 state buffer
-│   ├── morsh-predict/          # Predictive local echo model, divergence tracking
-│   ├── morsh-tunnel/           # TCP/UDP port forwarding, SOCKS5 proxy engine
-│   ├── morshd/                 # Server daemon binary
-│   └── morsh-cli/              # Client CLI binary (installed as `morsh`)
-4. Phased Implementation Roadmap
-   Phase 1: Workspace Foundation & Core QUIC Transport
-   Goal: Establish the workspace structure and basic secure QUIC connection between client and server.
-   Set up Cargo workspace and crate hierarchy.
-   Implement morsh-core binary protocol framing (framed messages / serialization with CBOR or postcard).
-   Implement morsh-transport: QUIC client and server using quinn with TLS 1.3 self-signed certificates or system PKI.
-   Basic hello-world stream exchange between morsh and morshd.
-   Phase 2: Stealth Handshake & Authentication (SSH3 Style)
-   Goal: Prevent port scanning identification and support SSH key authentication.
-   Implement stealth endpoint routing: client must provide a secret path / knock token during the ALPN/connection handshake; unauthorized probes are dropped or served a dummy 404.
-   Implement public-key authentication: Ed25519 and standard SSH public keys (~/.ssh/authorized_keys).
-   Integration with local ssh-agent.
-   Password / system user authentication support (Linux PAM).
-   Phase 3: Interactive PTY & Connection Migration (Roaming)
-   Goal: Full interactive shell with seamless IP roaming.
-   Server-side PTY allocation using portable-pty / Unix PTY, launching user login shell (/bin/bash, /bin/zsh).
-   Client raw terminal handling (crossterm): raw mode, resize events (SIGWINCH), clean terminal restoration on exit.
-   QUIC Connection Migration: simulate IP address change (e.g., switching network interfaces) to verify the shell session continues uninterrupted without reconnecting.
-   Phase 4: Port Forwarding & Tunnels
-   Goal: Support standard and modern forwarding modes.
-   Local TCP forwarding (-L local_port:remote_host:remote_port).
-   Remote TCP forwarding (-R remote_port:local_host:local_port).
-   Native UDP forwarding (using QUIC Datagrams or fast streams).
-   Dynamic proxy: integrated SOCKS5 proxy server on the client (-D port).
-   Phase 5: Session Persistence & Reconnection (Mosh Style)
-   Goal: Keep shell sessions alive through laptop sleep or hours of network disconnect.
-   Server session daemonization: decouple shell PTY processes from network connection lifetimes.
-   Session IDs and cryptographic reconnect tokens.
-   Virtual terminal emulation (vt100) running on morshd to maintain the canonical screen state.
-   Client reconnect handshake: seamlessly reattach to an existing session and synchronize the screen buffer.
-   Phase 6: Predictive Local Echo & Speculative UI (Mosh Style)
-   Goal: Mask high network latency with instant typing feedback.
-   Client-side prediction engine:
-   Printable characters, cursor navigation (arrow keys, Home/End), backspace.
-   Confidence scoring: disable prediction when terminal is in no-echo mode (e.g., password entry).
-   Visual feedback: underline unacknowledged speculative characters.
-   Server frame synchronization: acknowledge input sequence numbers.
-   Rollback engine: detect mispredictions and restore true server screen state within 1 RTT.
-   Phase 7: TCP Fallback & Network Resilience
-   Goal: Guarantee connectivity in restrictive networks.
-   Client auto-detection of UDP blocking (Happy Eyeballs timeout).
-   TCP fallback transport: TLS 1.3 over TCP framing.
-   Server dual-stack listener: UDP/QUIC primary + TCP fallback on the same or configurable port.
-   Phase 8: CLI Polish, Configuration & Distribution
-   Goal: Production-ready tooling.
-   Full CLI flags compatible with SSH habits (-p, -i, -L, -R, -D, -N, -v).
-   Configuration files (~/.morsh/config or /etc/morsh/morshd.toml).
-   Systemd service definition and packaging (morshd.service).
-
-
-### Core Crates
-
-- **`morsh-core`**: Protocol definitions, frame codecs, wire messages, error types, shared models.
-- **`morsh-transport`**: QUIC transport abstraction (`quinn` + `rustls`), connection migration, stealth knocking handshake, TCP fallback.
-- **`morsh-auth`**: Authentication mechanisms (SSH keys / `authorized_keys`, agent forwarding, password/PAM, secret knock tokens).
-- **`morsh-term`**: PTY management (`portable-pty`/nix), virtual terminal emulation (`vt100`), screen buffer diffing and detached session supervisor.
-- **`morsh-predict`**: Speculative local echo model, cursor prediction, divergence detection, and rollback engine.
-- **`morsh-tunnel`**: Port forwarding engine (TCP `-L`/`-R`, UDP forwarding, SOCKS5 proxy `-D`).
-- **`morshd`**: Server daemon executable.
-- **`morsh`**: Client CLI executable.
+├── Cargo.toml                  # Workspace root configuration
+├── ROADMAP.md                  # Master architecture blueprint (IMMUTABLE)
+├── PROGRESS.md                 # Living progress log & handoffs (APPEND-HEAVY)
+└── crates/
+    ├── morsh-core/             # Wire protocol frames, codecs, error types, constants
+    ├── morsh-transport/        # QUIC (Quinn + Rustls), TLS 1.3, TCP fallback, migration
+    ├── morsh-auth/             # SSH keys, ssh-agent, PAM, stealth token authentication
+    ├── morsh-term/             # PTY supervisor (portable-pty/nix), vt100 state buffer
+    ├── morsh-predict/          # Speculative local echo engine, divergence rollback
+    ├── morsh-tunnel/           # TCP/UDP port forwarding, SOCKS5 proxy engine
+    ├── morshd/                 # Server daemon executable (`morshd`)
+    └── morsh/                  # Client CLI executable (`morsh`)
+```
 
 ---
 
-## 2. Phased Roadmap
+## 3. Wire Protocol & Channel Layout
 
-### Phase 1: Workspace Foundation & Core QUIC Transport [IN PROGRESS]
-- [x] Multi-crate Cargo workspace setup.
-- [x] Wire protocol definitions in `morsh-core` (magic bytes, versioning, framed messages).
-- [x] QUIC transport foundation in `morsh-transport` using `quinn` + `rustls` (TLS 1.3).
-- [x] Self-signed / dynamic TLS certificate generation and verification helper.
-- [x] Minimal client (`morsh`) and daemon (`morshd`) with bidirectional handshake verification.
+### Framing Specification
+- Control messages are transmitted as length-prefixed binary frames:
+  - Header: `[u32 length in big-endian]` (4 bytes)
+  - Payload: Postcard-serialized binary struct (max `16 MiB`)
+- Application-Layer Protocol Negotiation (ALPN): `b"morsh-v1"`
+- Protocol Magic Header: `b"MRSH"`
+
+### Stream Channel Map
+| Stream ID / Type | Direction | Purpose |
+|---|---|---|
+| **Stream 0 (Bi)** | Client <-> Server | Control, authentication, window resizing, heartbeats |
+| **Stream 1 (Bi)** | Client <-> Server | Primary interactive PTY byte stream |
+| **Stream 2..N (Bi)** | Client <-> Server | TCP forwarded port channels or auxiliary execution streams |
+| **Datagrams (RFC 9221)** | Client <-> Server | Realtime UDP forwarding packets & delta screen sync frames |
+
+---
+
+## 4. Detailed Phased Roadmap
+
+### Phase 1: Workspace Foundation & Core QUIC Transport
+* **Goal**: Establish the workspace skeleton and verified secure QUIC transport.
+- Multi-crate Cargo workspace initialization with strict dependency boundary.
+- Wire protocol definition in `morsh-core`: length-prefixed postcard codec, control frame types (`ClientHello`, `ServerHello`, `Ping`, `Pong`, `Disconnect`).
+- QUIC transport abstraction in `morsh-transport` via `quinn` + `rustls` (TLS 1.3).
+- Ephemeral self-signed X.509 certificate generator (`rcgen`) and SHA-256 host key fingerprinting.
+- Executable binaries: `morshd` server daemon and `morsh` client CLI with initial handshake verification.
+- Comprehensive unit and integration test suite covering frame bounds, serialization, QUIC streams, and datagrams.
 
 ### Phase 2: Stealth Security & Authentication Layer (SSH3 Style)
-- [ ] Stealth handshake: secret URL path / knock token during handshake to avoid identification by port scanners (unrecognized probes receive dummy responses or silent drops).
-- [ ] SSH public-key authentication (Ed25519, ECDSA, RSA) via `~/.ssh/authorized_keys`.
-- [ ] Integration with SSH Agent (`ssh-agent` / unix domain socket).
-- [ ] System authentication (Linux PAM / password) and token/bearer pre-auth credentials.
+* **Goal**: Defend against port scanning and implement standard & modern authentication mechanisms.
+- **Stealth Knocking**: Enforce secret path/token verification during handshake. Non-matching probes receive silent connection drops or HTTP 404 responses.
+- **SSH Public Key Authentication**: Support Ed25519, RSA, and ECDSA keys matching standard `~/.ssh/authorized_keys`.
+- **SSH Agent Integration**: Connect to local `ssh-agent` UNIX domain socket to sign authentication challenges without prompting for passphrases.
+- **System Authentication**: Linux PAM integration for user login credentials and session permission drop (`setuid`/`setgid`).
 
 ### Phase 3: Interactive PTY & QUIC Connection Migration (Roaming)
-- [ ] Server-side PTY allocation (spawning `/bin/bash` or user shell).
-- [ ] Client-side raw terminal mode with `crossterm` and window resize event propagation (`SIGWINCH`).
-- [ ] Multiplexed QUIC streams for standard input/output/error and out-of-band window changes.
-- [ ] Connection migration validation: seamless IP address switching without dropping active interactive sessions.
+* **Goal**: Deliver a responsive, raw terminal interactive shell with network roaming resilience.
+- **PTY Supervisor**: Server-side pseudo-terminal allocation (`portable-pty`/Unix PTY) running user login shell (`/bin/bash`, `/bin/zsh`).
+- **Client Raw Mode**: Terminal raw mode management (`crossterm`), raw input forwarding, and clean terminal state restoration on exit.
+- **Window Resizing**: Out-of-band propagation of window resize events (`SIGWINCH` / cols & rows).
+- **QUIC Connection Migration**: Server-side verification of Connection ID (CID) validation to ensure active interactive sessions persist through IP/interface switching (Wi-Fi <-> Cellular).
 
 ### Phase 4: Port Forwarding & Tunnels
-- [ ] Local TCP forwarding (`-L local_port:remote_host:remote_port`).
-- [ ] Remote TCP forwarding (`-R remote_port:local_host:local_port`).
-- [ ] Native UDP port forwarding via QUIC datagrams / streams.
-- [ ] Dynamic proxy: client-side SOCKS5 proxy server (`-D port`).
+* **Goal**: Provide modern tunneling capabilities for TCP, UDP, and dynamic proxying.
+- **Local TCP Forwarding (`-L`)**: Forward local ports through QUIC streams to remote hosts.
+- **Remote TCP Forwarding (`-R`)**: Forward remote ports through QUIC streams to client networks.
+- **Native UDP Forwarding**: Forward UDP packets bidirectionally using QUIC Datagrams or fast streams.
+- **Dynamic SOCKS5 Proxy (`-D`)**: Integrated local SOCKS5 proxy server multiplexed through the morsh session.
 
-### Phase 5: Session Persistence & Reconnection (Mosh Style)
-- [ ] Decouple PTY shell lifetimes from individual client connection lifecycles.
-- [ ] Cryptographic session resumption tokens.
-- [ ] Server-side virtual terminal emulator (`vt100`) maintaining active screen buffers.
-- [ ] Seamless reattachment: reconnecting clients receive current screen state snapshot rather than raw unbuffered streams.
+### Phase 5: Session Persistence & Screen State Recovery (Mosh Style)
+* **Goal**: Decouple shell lifetime from network connection lifetime and support detached reattachment.
+- **Detached PTY Supervisor**: The shell session continues running when a client disconnects or sleeps.
+- **Session Tokens**: Cryptographic 128-bit session tokens for resuming detached sessions.
+- **Screen State Tracking**: Server-side virtual terminal emulator (`vt100`) maintaining screen buffers and cursor state.
+- **Fast Resumption**: Reconnecting clients receive an immediate screen snapshot rather than replaying unbuffered byte history.
 
 ### Phase 6: Predictive Local Echo & Speculative UI (Mosh Style)
-- [ ] Client-side predictive keystroke model (printable chars, backspace, arrow keys).
-- [ ] Visual indicator for speculative output (underlining or dimming).
-- [ ] Server frame sequence acknowledgement and 1-RTT automatic rollback on divergence (e.g. vim modes, password fields, completion).
+* **Goal**: Eliminate perceived latency on high-RTT networks.
+- **Predictive Engine**: Optimistically echoes printable characters, cursor navigation (arrow keys), and backspace locally.
+- **Visual Feedback**: Speculative characters are styled (e.g. underlined or dimmed) until acknowledged by server sequence frames.
+- **Confidence Tracking**: Heuristics to suppress speculative echo during no-echo modes (e.g. password entry) or complex fullscreen apps.
+- **1-RTT Rollback**: Automatic correction when server output diverges from local predictions.
 
 ### Phase 7: TCP Fallback & Network Resilience
-- [ ] Happy Eyeballs auto-detection for UDP-restricted networks.
-- [ ] Fallback transport using TLS 1.3 over TCP.
-- [ ] Dual-listening daemon supporting simultaneous QUIC and TCP fallback.
+* **Goal**: Ensure connectivity in environments blocking UDP/QUIC.
+- **Happy Eyeballs Auto-Detection**: Fast race between QUIC/UDP and TCP fallback.
+- **TLS 1.3 over TCP**: Framing layer running TLS 1.3 over TCP stream sockets.
+- **Dual-Stack Listener**: `morshd` listening concurrently on QUIC/UDP and TCP fallback ports.
 
-### Phase 8: CLI Ergonomics, Configuration, & Production Packaging
-- [ ] Full OpenSSH-compatible CLI options (`-p`, `-i`, `-L`, `-R`, `-D`, `-N`, `-v`).
-- [ ] Client and daemon configuration files (`morsh.toml`, `morshd.toml`).
-- [ ] Systemd service unit (`morshd.service`) and distribution packaging.
+### Phase 8: Production Polish, Configuration & Distribution
+* **Goal**: Deliver a production-grade CLI and system daemon.
+- **OpenSSH Compatibility**: Command-line flag compatibility with OpenSSH conventions (`-p`, `-i`, `-L`, `-R`, `-D`, `-N`, `-v`).
+- **Configuration Files**: TOML configuration support (`~/.morsh/config.toml` and `/etc/morsh/morshd.toml`).
+- **Packaging & Daemonization**: Systemd service definition (`morshd.service`), signals (`SIGHUP`, `SIGTERM`), and Debian/tarball packaging.

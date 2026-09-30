@@ -248,3 +248,63 @@ async fn main() -> Result<()> {
     println!("Session cleanly terminated.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_destination_various_formats() {
+        // Standard host only
+        let d1 = parse_destination("example.com", None).unwrap();
+        assert_eq!(d1.user, None);
+        assert_eq!(d1.host, "example.com");
+        assert_eq!(d1.port, 2222);
+
+        // Host and port
+        let d2 = parse_destination("example.com:4444", None).unwrap();
+        assert_eq!(d2.user, None);
+        assert_eq!(d2.host, "example.com");
+        assert_eq!(d2.port, 4444);
+
+        // User and host
+        let d3 = parse_destination("alice@example.com", None).unwrap();
+        assert_eq!(d3.user, Some("alice".into()));
+        assert_eq!(d3.host, "example.com");
+        assert_eq!(d3.port, 2222);
+
+        // User, host, and port
+        let d4 = parse_destination("bob@192.168.1.50:2022", None).unwrap();
+        assert_eq!(d4.user, Some("bob".into()));
+        assert_eq!(d4.host, "192.168.1.50");
+        assert_eq!(d4.port, 2022);
+
+        // Port override takes precedence when port omitted in dest
+        let d5 = parse_destination("srv", Some(3333)).unwrap();
+        assert_eq!(d5.port, 3333);
+
+        // Port override takes precedence over dest port
+        let d6 = parse_destination("srv:2222", Some(9999)).unwrap();
+        assert_eq!(d6.port, 9999);
+
+        // IPv6 bracket syntax
+        let d7 = parse_destination("[::1]:8080", None).unwrap();
+        assert_eq!(d7.user, None);
+        assert_eq!(d7.host, "::1");
+        assert_eq!(d7.port, 8080);
+
+        // IPv6 with user
+        let d8 = parse_destination("carol@[fe80::1]", None).unwrap();
+        assert_eq!(d8.user, Some("carol".into()));
+        assert_eq!(d8.host, "fe80::1");
+        assert_eq!(d8.port, 2222);
+    }
+
+    #[test]
+    fn test_parse_destination_invalid() {
+        assert!(parse_destination("", None).is_err());
+        assert!(parse_destination("@", None).is_err());
+        assert!(parse_destination("[::1", None).is_err()); // Unclosed bracket
+        assert!(parse_destination("host:notaport", None).is_err());
+    }
+}
