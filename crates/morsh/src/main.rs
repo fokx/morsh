@@ -1,11 +1,16 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use morsh_core::protocol::{ControlMessage, PROTOCOL_VERSION};
+use morsh_auth::{
+    find_first_default_private_key, load_private_key_file, sign_challenge, AgentClient,
+};
+use morsh_core::protocol::{AuthMethod, AuthRequest, ControlMessage, PROTOCOL_VERSION};
 use morsh_transport::{make_client_config, MorshConnection, QuicClient};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+
 
 #[derive(Parser, Debug)]
 #[command(
@@ -21,6 +26,18 @@ struct Args {
     /// Override remote port (defaults to 2222 or port from destination)
     #[arg(short = 'p', long)]
     port: Option<u16>,
+
+    /// Path to SSH private key file (e.g. ~/.ssh/id_ed25519)
+    #[arg(short = 'i', long)]
+    identity: Option<PathBuf>,
+
+    /// Password for password / PAM authentication
+    #[arg(long)]
+    password: Option<String>,
+
+    /// Disable querying local ssh-agent ($SSH_AUTH_SOCK)
+    #[arg(long)]
+    no_agent: bool,
 
     /// Accept any server certificate without validation (insecure / testing mode)
     #[arg(short = 'k', long)]
@@ -103,10 +120,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let filter = if args.verbose {
-        EnvFilter::new("morsh=debug,morsh_transport=debug,quinn=info")
+        EnvFilter::new("morsh=debug,morsh_transport=debug,morsh_auth=debug,quinn=info")
     } else {
         EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("morsh=info,morsh_transport=info"))
+            .unwrap_or_else(|_| EnvFilter::new("morsh=info,morsh_transport=info,morsh_auth=info"))
     };
 
     tracing_subscriber::fmt()
@@ -176,7 +193,7 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to receive ServerHello response")?;
 
-    match server_hello {
+    let (session_id, supported_auth) = match server_hello {
         ControlMessage::ServerHello {
             version,
             server_software,
@@ -193,6 +210,7 @@ async fn main() -> Result<()> {
             println!("   Auth Supported  : {:?}", supported_auth);
             println!("   Round-Trip Time : {:.2} ms", conn.rtt().as_secs_f64() * 1000.0);
             println!("========================================================");
+            (session_id, supported_auth)
         }
         ControlMessage::Disconnect { reason_code, message } => {
             eprintln!("Server disconnected during handshake (code {}): {}", reason_code, message);
@@ -201,6 +219,114 @@ async fn main() -> Result<()> {
         }
         other => {
             bail!("Unexpected response from server: {:?}", other);
+        }
+    };
+
+    // Phase 2: Perform Authentication if required by server
+    let requires_auth = !(supported_auth.len() == 1 && supported_auth[0] == AuthMethod::None
+        && args.identity.is_none() && args.password.is_none());
+
+    if requires_auth {
+        debug!("Waiting for AuthChallenge frame from server...");
+        let challenge_msg = MorshConnection::read_control_message(&mut recv)
+            .await
+            .context("Failed to receive AuthChallenge from server")?;
+
+        let challenge = match challenge_msg {
+            ControlMessage::AuthChallenge { challenge } => challenge,
+            ControlMessage::Disconnect { reason_code, message } => {
+                bail!("Server disconnected before auth challenge (code {}): {}", reason_code, message);
+            }
+            other => bail!("Expected AuthChallenge, got {:?}", other),
+        };
+
+        let username = parsed.user.clone().unwrap_or_else(|| {
+            std::env::var("USER").unwrap_or_else(|_| "root".into())
+        });
+
+        info!(username = %username, "Authenticating with server...");
+
+        // Select credentials
+        let auth_req = if let Some(ref key_path) = args.identity {
+            info!(path = %key_path.display(), "Using specified SSH private key");
+            let sk = load_private_key_file(key_path, None)?;
+            let (algorithm, public_key, signature) =
+                sign_challenge(&sk, &session_id, &challenge, &username)?;
+            AuthRequest::PublicKey { username, algorithm, public_key, signature }
+        } else if !args.no_agent && AgentClient::is_available() {
+            info!("Querying ssh-agent for credentials...");
+            match AgentClient::connect_env() {
+                Ok(mut agent) => {
+                    let identities = agent.list_identities()?;
+                    if let Some(first_id) = identities.first() {
+                        info!(key = %first_id.to_openssh().unwrap_or_default(), "Signing challenge with ssh-agent identity");
+                        let (algorithm, public_key, signature) =
+                            agent.sign_challenge(first_id, &session_id, &challenge, &username)?;
+                        AuthRequest::PublicKey { username, algorithm, public_key, signature }
+                    } else if let Some(def_key) = find_first_default_private_key() {
+                        info!(path = %def_key.display(), "ssh-agent has no identities; using default SSH private key");
+                        let sk = load_private_key_file(&def_key, None)?;
+                        let (algorithm, public_key, signature) =
+                            sign_challenge(&sk, &session_id, &challenge, &username)?;
+                        AuthRequest::PublicKey { username, algorithm, public_key, signature }
+                    } else if let Some(ref pw) = args.password {
+                        AuthRequest::Password { username, password: pw.as_bytes().to_vec() }
+                    } else if supported_auth.contains(&AuthMethod::None) {
+                        AuthRequest::None { username }
+                    } else {
+                        bail!("ssh-agent has no keys and no default keys found in ~/.ssh/");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to connect to ssh-agent; falling back to file search");
+                    if let Some(def_key) = find_first_default_private_key() {
+                        info!(path = %def_key.display(), "Using default SSH private key");
+                        let sk = load_private_key_file(&def_key, None)?;
+                        let (algorithm, public_key, signature) =
+                            sign_challenge(&sk, &session_id, &challenge, &username)?;
+                        AuthRequest::PublicKey { username, algorithm, public_key, signature }
+                    } else if let Some(ref pw) = args.password {
+                        AuthRequest::Password { username, password: pw.as_bytes().to_vec() }
+                    } else {
+                        bail!("Could not connect to ssh-agent and no default key found: {}", e);
+                    }
+                }
+            }
+        } else if let Some(def_key) = find_first_default_private_key() {
+            info!(path = %def_key.display(), "Using default SSH private key");
+            let sk = load_private_key_file(&def_key, None)?;
+            let (algorithm, public_key, signature) =
+                sign_challenge(&sk, &session_id, &challenge, &username)?;
+            AuthRequest::PublicKey { username, algorithm, public_key, signature }
+        } else if let Some(ref pw) = args.password {
+            AuthRequest::Password { username, password: pw.as_bytes().to_vec() }
+        } else if supported_auth.contains(&AuthMethod::None) {
+            AuthRequest::None { username }
+        } else {
+            bail!("No SSH keys found, ssh-agent not available, and no password supplied");
+        };
+
+        debug!("Sending AuthRequest frame");
+        MorshConnection::send_control_message(&mut send, &ControlMessage::AuthRequest(auth_req)).await?;
+
+        debug!("Awaiting AuthResult frame");
+        let result_msg = MorshConnection::read_control_message(&mut recv)
+            .await
+            .context("Failed to receive AuthResult from server")?;
+
+        match result_msg {
+            ControlMessage::AuthResult { success: true, message } => {
+                println!(">> Authentication Successful: {}", message);
+            }
+            ControlMessage::AuthResult { success: false, message } => {
+                eprintln!(">> Authentication FAILED: {}", message);
+                conn.close(401, "Authentication failed");
+                bail!("Authentication rejected by server: {}", message);
+            }
+            ControlMessage::Disconnect { reason_code, message } => {
+                bail!("Server disconnected during authentication (code {}): {}", reason_code, message);
+            }
+            other => bail!("Expected AuthResult, got {:?}", other),
         }
     }
 

@@ -137,6 +137,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_auth_frames_roundtrip() {
+        use crate::protocol::AuthRequest;
+
+        let challenge = ControlMessage::AuthChallenge {
+            challenge: [0x5au8; 32],
+        };
+
+        let pk_req = ControlMessage::AuthRequest(AuthRequest::PublicKey {
+            username: "alice".into(),
+            algorithm: "ssh-ed25519".into(),
+            public_key: vec![1, 2, 3, 4],
+            signature: vec![5, 6, 7, 8],
+        });
+
+        let pw_req = ControlMessage::AuthRequest(AuthRequest::Password {
+            username: "bob".into(),
+            password: b"secret123".to_vec(),
+        });
+
+        let none_req = ControlMessage::AuthRequest(AuthRequest::None {
+            username: "guest".into(),
+        });
+
+        let result_ok = ControlMessage::AuthResult {
+            success: true,
+            message: "Welcome alice".into(),
+        };
+
+        let result_err = ControlMessage::AuthResult {
+            success: false,
+            message: "Authentication failed: invalid signature".into(),
+        };
+
+        for msg in [challenge, pk_req, pw_req, none_req, result_ok, result_err] {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &msg).await.unwrap();
+            let mut reader = Cursor::new(buffer);
+            let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+
+    #[tokio::test]
     async fn test_frame_too_large_rejected() {
         // Construct a frame header indicating size > MAX_FRAME_SIZE
         let excessive_len = (MAX_FRAME_SIZE + 1) as u32;

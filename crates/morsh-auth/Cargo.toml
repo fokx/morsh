@@ -8,3 +8,15 @@ authors.workspace = true
 [dependencies]
 morsh-core.workspace = true
 thiserror.workspace = true
+ssh-key = { version = "0.6", features = ["crypto", "ed25519", "rsa", "ecdsa", "std", "encryption"] }
+ring = "0.17"
+
+ssh-agent-client-rs = "1.1"
+tracing = { workspace = true }
+pam = "0.8"
+signature = "2.2"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+[dev-dependencies]
+morsh-transport.workspace = true
+tokio = { workspace = true, features = ["full"] }

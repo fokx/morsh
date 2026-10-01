@@ -25,6 +25,27 @@ pub enum AuthMethod {
     KnockToken,
 }
 
+/// Authentication request submitted by the client during handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthRequest {
+    /// No authentication credentials (permitted only if server advertises AuthMethod::None).
+    None { username: String },
+
+    /// SSH Public key authentication (Ed25519, RSA, ECDSA).
+    PublicKey {
+        username: String,
+        algorithm: String,
+        public_key: Vec<u8>,
+        signature: Vec<u8>,
+    },
+
+    /// Password / PAM based authentication.
+    Password {
+        username: String,
+        password: Vec<u8>,
+    },
+}
+
 /// Control message payload exchanged over Stream 0 (Control Stream).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMessage {
@@ -54,6 +75,23 @@ pub enum ControlMessage {
         session_resumed: bool,
     },
 
+    /// Cryptographic authentication challenge sent by the server to the client.
+    AuthChallenge {
+        /// 32-byte cryptographically secure random challenge.
+        challenge: [u8; 32],
+    },
+
+    /// Authentication attempt submitted by the client.
+    AuthRequest(AuthRequest),
+
+    /// Server authentication outcome acknowledging or denying access.
+    AuthResult {
+        /// True if credentials were accepted, false otherwise.
+        success: bool,
+        /// Informational or error message.
+        message: String,
+    },
+
     /// Liveness heartbeat ping.
     Ping {
         seq: u64,
@@ -72,6 +110,22 @@ pub enum ControlMessage {
         message: String,
     },
 }
+
+/// Helper to construct the canonical challenge payload to be signed by SSH key or agent.
+/// Binds protocol version domain separator, session_id, challenge bytes, and username.
+pub fn make_challenge_payload(
+    session_id: &[u8; 16],
+    challenge: &[u8; 32],
+    username: &str,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16 + 16 + 32 + username.len());
+    payload.extend_from_slice(b"morsh-auth-v1:");
+    payload.extend_from_slice(session_id);
+    payload.extend_from_slice(challenge);
+    payload.extend_from_slice(username.as_bytes());
+    payload
+}
+
 
 /// Identifiers for multiplexed QUIC streams within a morsh session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

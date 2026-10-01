@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 morsh-core.workspace = true
 morsh-transport.workspace = true
+morsh-auth.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio.workspace = true
@@ -19,3 +20,4 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+

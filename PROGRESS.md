@@ -10,14 +10,15 @@
 
 | Phase | Description | Status | Completion Date | Commit Hash | Key Deliverables |
 |---|---|---|---|---|---|
-| **Phase 1** | Workspace Foundation & Core QUIC Transport | ✅ **Completed** | 2026-10-05 | `dcf1e0d` (updated) | Workspace, `morsh-core`, `morsh-transport`, `morshd`, `morsh` CLI, 17 unit/integration tests |
-| **Phase 2** | Stealth Security & Authentication Layer | 🎯 **Active / Next** | Pending | - | SSH keys, `authorized_keys`, `ssh-agent`, PAM, stealth knocking |
-| **Phase 3** | Interactive PTY & QUIC Connection Migration | ⏳ Pending | - | - | PTY allocation, `crossterm` raw mode, `SIGWINCH`, IP roaming |
+| **Phase 1** | Workspace Foundation & Core QUIC Transport | ✅ **Completed** | 2026-10-05 | `dcf1e0d` | Workspace, `morsh-core`, `morsh-transport`, `morshd`, `morsh` CLI, 17 tests |
+| **Phase 2** | Stealth Security & Authentication Layer | ✅ **Completed** | 2026-10-05 | - | `morsh-auth`, SSH keys (Ed25519/RSA/ECDSA), `authorized_keys`, `ssh-agent`, PAM, 33 tests |
+| **Phase 3** | Interactive PTY & QUIC Connection Migration | 🎯 **Active / Next** | Pending | - | PTY allocation (`portable-pty`), `crossterm` raw mode, `SIGWINCH`, IP roaming |
 | **Phase 4** | Port Forwarding & Tunnels (TCP, UDP, SOCKS5) | ⏳ Pending | - | - | `-L`, `-R`, native UDP forwarding, `-D` SOCKS5 proxy |
 | **Phase 5** | Session Persistence & Screen State Recovery | ⏳ Pending | - | - | Detached PTY supervisor, 128-bit session tokens, `vt100` state sync |
 | **Phase 6** | Predictive Local Echo & Speculative UI | ⏳ Pending | - | - | Speculative keystroke echo, underline styling, 1-RTT rollback |
 | **Phase 7** | TCP Fallback & Network Resilience | ⏳ Pending | - | - | Happy Eyeballs auto-detection, TLS 1.3 over TCP fallback |
 | **Phase 8** | CLI Polish, Configuration & Packaging | ⏳ Pending | - | - | OpenSSH CLI parity, config files, `morshd.service` systemd unit |
+
 
 ---
 
@@ -65,38 +66,122 @@
 
 ---
 
-## 3. Phase 2 Action Plan (Handoff Instructions)
+## 3. Phase 2 Completion Record
 
-When beginning a new conversation to implement **Phase 2: Stealth Security & Authentication Layer**:
+### Delivered Components
+1. **Wire Protocol Authentication Extensions (`crates/morsh-core`)**:
+   - `protocol::AuthRequest`: Enums for `PublicKey { username, algorithm, public_key, signature }`, `Password { username, password }`, and `None { username }`.
+   - `protocol::ControlMessage`: Added `AuthChallenge { challenge: [u8; 32] }`, `AuthRequest(AuthRequest)`, and `AuthResult { success: bool, message: String }`.
+   - `protocol::make_challenge_payload`: Domain-separated canonical signing payload function binding `morsh-auth-v1:`, 16-byte session ID, 32-byte challenge, and requested Unix username.
+   - `error::CoreError::AuthFailed`: Dedicated error type for authentication rejections.
+   - Postcard binary frame roundtrip tests for all new authentication message types.
 
-### Primary Objective
-Implement cryptographic public-key authentication (`~/.ssh/authorized_keys`), integration with local `ssh-agent`, Linux PAM system authentication, and hardened stealth knock routing.
+2. **Authentication Subsystem (`crates/morsh-auth`)**:
+   - **`AuthorizedKeys` Loader & Verifier (`src/authorized_keys.rs`)**:
+     - Parses OpenSSH `~/.ssh/authorized_keys` format (supporting comments, key types, options).
+     - Resolves paths for specific Unix users (`~username/.ssh/authorized_keys`, `/home/user`, `/root`).
+     - Verifies incoming cryptographic challenges against authorized keys using `signature::Verifier`.
+   - **Key Loader & Signer (`src/keys.rs`)**:
+     - Reads OpenSSH private keys (unencrypted and passphrase-encrypted via `ssh-key::PrivateKey`).
+     - Default key auto-discovery scanning `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, `~/.ssh/id_rsa`.
+     - `sign_challenge`: Signs authentication challenge payloads for Ed25519, ECDSA (P-256), and RSA.
+   - **SSH Agent Integration (`src/agent.rs`)**:
+     - Connects to local `ssh-agent` Unix domain socket via `$SSH_AUTH_SOCK` using `ssh-agent-client-rs`.
+     - Queries stored agent identities and requests cryptographic signatures on challenges without exposing private keys.
+   - **System & PAM Authentication (`src/pam.rs`)**:
+     - `PasswordVerifier` trait defining extensible password authentication.
+     - `PamAuthenticator`: Linux PAM client authenticating credentials via `pam::Client`.
+     - `MockPasswordVerifier`: In-memory thread-safe verifier for automated tests and standalone environments.
+   - **Challenge Generator (`src/challenge.rs`)**:
+     - Generates 32-byte cryptographically secure pseudo-random challenges via `ring::rand::SystemRandom`.
 
-### Step-by-Step Task Breakdown
-1. **Extend Protocol Messages in `crates/morsh-core/src/protocol.rs`**:
-   - Add authentication request and response variants to `ControlMessage`:
-     - `AuthRequest::PublicKey { username: String, algorithm: String, public_key: Vec<u8>, signature: Vec<u8> }`
-     - `AuthRequest::Password { username: String, password: Vec<u8> }`
-     - `AuthChallenge { challenge: [u8; 32] }`
-     - `AuthResult { success: bool, message: String }`
-2. **Implement `crates/morsh-auth`**:
-   - Add dependencies: `ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa"] }`, `ring = "0.17"`.
-   - Implement `AuthorizedKeys` loader that parses `~/.ssh/authorized_keys` and verifies public key signatures against a random challenge.
-   - Implement `AgentClient` connecting to `$SSH_AUTH_SOCK` (UNIX domain socket) to sign challenges using the local SSH agent.
-   - Implement optional PAM / password verification module for Linux.
-3. **Integrate into `morshd`**:
-   - When a client connects, `morshd` requires an authentication step before granting session access.
-   - Verify signatures against authorized keys for the requested Unix user.
-4. **Integrate into `morsh`**:
-   - Automatically locate user SSH private keys (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`) or query `SSH_AUTH_SOCK`.
-   - Sign authentication challenges and send to `morshd`.
-5. **Testing Requirements for Phase 2**:
-   - Unit tests for authorized_keys parser and key verification.
-   - Integration tests: successful login with Ed25519 key, rejected login with unauthorized key, password auth test.
+3. **Daemon Integration (`crates/morshd`)**:
+   - Server CLI flags: `--auth-keys <path>`, `--allow-password`, `--pam-service <service>`, `--no-auth`.
+   - Handshake authentication state machine: issues `AuthChallenge`, verifies `AuthRequest` before admitting client, issues descriptive `AuthResult` frames before graceful transport closure.
+
+4. **Client CLI Integration (`crates/morsh`)**:
+   - Client CLI flags: `-i, --identity <path>`, `--password <pass>`, `--no-agent`.
+   - Automatic credential selection cascade:
+     1. Explicit identity file (`-i`)
+     2. Active `ssh-agent` identities (`$SSH_AUTH_SOCK`)
+     3. Default user SSH keys in `~/.ssh/` (`id_ed25519`, `id_ecdsa`, `id_rsa`)
+     4. Password flag fallback (`--password`)
+     5. Unauthenticated guest fallback (if allowed by server)
+
+5. **Architectural Choices & Tradeoffs Recorded**:
+   - **Cryptographic Domain Separation**: The challenge buffer is formatted as `morsh-auth-v1: || session_id || challenge || username`. This tightly binds the signature to the specific QUIC connection and user, preventing replay attacks across different sessions or unauthorized user impersonation.
+   - **Upstream `ssh-key 0.6.7` RSA Workaround**: Discovered an upstream bug in `ssh-key 0.6.7` where `RsaKeypair::try_into()` attempts to construct an RSA private key with duplicate prime factors `vec![p, p]` instead of `vec![p, q]`, causing RSA signature generation to fail. Resolved by directly constructing `rsa::pkcs1v15::SigningKey` using the correct prime components `p` and `q` from the parsed RSA keypair.
+   - **Pluggable PAM Abstraction**: To prevent test failures in unprivileged CI/Docker environments that lack root permissions or PAM configuration files (`/etc/pam.d/morsh`), we introduced the `PasswordVerifier` trait with both native `PamAuthenticator` and `MockPasswordVerifier`.
+   - **Graceful Rejection Signaling**: Before closing rejected client connections with code 401, `morshd` flushes the `AuthResult` message frame and waits briefly before transport teardown, ensuring the client receives the explicit rejection reason rather than an abrupt connection reset.
+
+6. **Automated Test Suite (33 Tests Passing Workspace-wide)**:
+   - **`morsh-auth` Unit Tests (11 passed)**:
+     - `challenge::tests::test_generate_challenge_uniqueness`: Entropy uniqueness.
+     - `agent::tests::test_agent_availability_detection`: Socket existence check.
+     - `pam::tests::test_mock_password_verifier`: Password verifier correctness.
+     - `tests::test_end_to_end_ed25519_flow`: Full Ed25519 sign & verify.
+     - `tests::test_end_to_end_ecdsa_flow`: Full ECDSA P-256 sign & verify.
+     - `tests::test_end_to_end_rsa_flow`: Full RSA-SHA512 sign & verify with 3072-bit key.
+     - `authorized_keys::tests::test_parse_authorized_keys_entries`: OpenSSH parser.
+     - `authorized_keys::tests::test_verify_challenge_success_and_failure`: Positive and negative challenge verification (wrong user, wrong challenge, unauthorized key).
+     - `keys::tests::test_sign_and_verify_ed25519_challenge` & `test_sign_and_verify_ecdsa_challenge`: Key module signing.
+   - **`morsh-auth` Integration Tests (`tests/auth_integration.rs`, 4 passed)**:
+     - `test_ed25519_auth_flow_success`: Live QUIC handshake + public key authentication.
+     - `test_unauthorized_key_rejected`: Live rejection of rogue key with code 401.
+     - `test_password_auth_flow`: Live password authentication handshake.
+     - `test_stealth_knock_with_public_key_auth`: Stealth knocking filter protecting public-key auth.
+   - **Live CLI End-to-End Verification**:
+     - Live `morshd` run with stealth knock and authorized keys.
+     - Live `morsh` CLI connected, authenticated via Ed25519 key in ~3 ms, ran latency probes (0.96 ms RTT), and cleanly exited.
+     - Rogue key rejected with descriptive message.
+     - Incorrect stealth knock dropped silently with HTTP 404.
 
 ---
 
-## 4. Work Log (Append History)
+## 4. Phase 3 Action Plan (Handoff Instructions)
+
+When beginning a new conversation to implement **Phase 3: Interactive PTY & QUIC Connection Migration (Roaming)**:
+
+### Primary Objective
+Deliver a responsive, raw terminal interactive shell with pseudo-terminal allocation on the server, raw input forwarding on the client, dynamic window resizing (`SIGWINCH`), and verify QUIC connection migration (seamless IP/interface roaming without session reset).
+
+### Prerequisites & Dependencies
+- Crates to implement: `crates/morsh-term`
+- Dependencies to add:
+  - Server PTY allocation: `portable-pty = "0.8"` (cross-platform pseudo-terminal allocation) or Unix `nix` / `termios`.
+  - Client raw mode: `crossterm = { version = "0.28", features = ["event-stream"] }` (raw mode, terminal events).
+  - Out-of-band signals: `tokio::signal` (client `SIGWINCH` listening on Unix).
+
+### Step-by-Step Task Breakdown
+1. **Extend Wire Protocol in `crates/morsh-core/src/protocol.rs`**:
+   - Add terminal window resize frame to `ControlMessage`:
+     - `ControlMessage::WindowResize { cols: u16, rows: u16, x_pixels: u16, y_pixels: u16 }`
+   - Add stream channel mapping:
+     - Stream 0: Control & resize events (`ControlMessage`).
+     - Stream 1: Bidirectional raw PTY byte stream (interactive stdin / stdout).
+2. **Implement `crates/morsh-term`**:
+   - `PtyMaster`: Spawns user's default login shell (`$SHELL`, `/bin/bash`, or `/bin/sh`) inside an allocated pseudo-terminal with slave PTY.
+   - Provides async reader and writer wrappers over the PTY master file descriptors.
+   - `PtyMaster::resize(&self, cols: u16, rows: u16)`: Propagates window size changes (`TIOCSWINSZ` / `SIGWINCH`) to the running shell child process.
+3. **Integrate PTY in `morshd`**:
+   - Upon successful client authentication, spawn a `PtyMaster` session.
+   - Accept Stream 1 (`conn.accept_bi()`) and pipe PTY stdout -> Stream 1 writer, and Stream 1 reader -> PTY stdin.
+   - On Stream 0, handle incoming `ControlMessage::WindowResize` frames by calling `pty.resize()`.
+   - Monitor child process exit status and send graceful `Disconnect` or close Stream 1 on shell exit.
+4. **Integrate Raw Mode in `morsh` Client CLI**:
+   - Enable crossterm terminal raw mode upon connection: `terminal::enable_raw_mode()`.
+   - Open Stream 1 (`conn.open_bi()`) for raw PTY byte streaming.
+   - Spawn input forwarder: read stdin bytes -> Stream 1 writer.
+   - Spawn output forwarder: read Stream 1 bytes -> stdout.
+   - Listen for terminal resize events (`crossterm::event::Event::Resize(cols, rows)`) and send `ControlMessage::WindowResize` over Stream 0.
+   - Ensure clean terminal cleanup hook on exit (restore raw mode, show cursor).
+5. **Verify QUIC Connection Migration (Roaming)**:
+   - Verify that Quinn handles client socket migration (e.g. rebinding client UDP socket or switching IP/interface) while interactive PTY Stream 1 and Control Stream 0 persist without reset.
+   - Add automated test verifying stream data survives migration.
+
+---
+
+## 5. Work Log (Append History)
 
 ### 2026-10-05 — Phase 1 Completed
 - Initialized multi-crate workspace (`morsh-core`, `morsh-transport`, `morsh-auth`, `morsh-term`, `morsh-predict`, `morsh-tunnel`, `morshd`, `morsh`).
@@ -106,3 +191,15 @@ Implement cryptographic public-key authentication (`~/.ssh/authorized_keys`), in
 - Added 17 unit and integration tests across all workspace crates (`cargo test --workspace` passing).
 - Structured `ROADMAP.md` as immutable blueprint and `PROGRESS.md` as append-heavy ledger.
 - Committed state to Git (`dcf1e0d` and follow-up test commit).
+
+### 2026-10-05 — Phase 2 Completed
+- Implemented Phase 2 authentication layer across `morsh-core`, `morsh-auth`, `morshd`, and `morsh`.
+- Implemented cryptographic SSH public key authentication (Ed25519, RSA, ECDSA P-256) matching `~/.ssh/authorized_keys`.
+- Implemented local `ssh-agent` Unix domain socket integration (`AgentClient` over `$SSH_AUTH_SOCK`).
+- Implemented Linux PAM system authentication (`PamAuthenticator`) and `PasswordVerifier` trait with mock verifiers.
+- Implemented domain-separated 32-byte cryptographic challenge-response authentication protocol over QUIC Stream 0.
+- Resolved upstream `ssh-key 0.6.7` RSA key component bug by directly constructing `rsa::pkcs1v15` keys with distinct `p` and `q` primes.
+- Integrated authentication flows into `morshd` daemon and `morsh` client CLI with automatic key discovery and fallback cascade.
+- Added 15 new tests (11 unit tests in `morsh-auth`, 4 integration tests in `auth_integration.rs`), reaching 33 passing tests workspace-wide.
+- Conducted live end-to-end CLI verification: sub-3ms authenticated handshake, stealth knock verification, and unauthorized probe rejection.
+

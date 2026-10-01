@@ -25,6 +25,10 @@ pub enum CoreError {
 
     #[error("Incompatible protocol version: client v{client}, server v{server}")]
     IncompatibleVersion { client: u32, server: u32 },
+
+    #[error("Authentication failed: {0}")]
+    AuthFailed(String),
 }
+
 
 pub type Result<T> = std::result::Result<T, CoreError>;
