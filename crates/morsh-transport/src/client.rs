@@ -48,6 +48,30 @@ impl QuicClient {
         Ok(MorshConnection::new(conn))
     }
 
+    /// Access the underlying Quinn endpoint.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Retrieves the local socket address this client endpoint is currently bound to.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint
+            .local_addr()
+            .context("Failed to get client local address")
+    }
+
+    /// Rebinds the client endpoint to a new UDP socket, triggering QUIC connection migration (roaming).
+    pub fn rebind(&self, socket: std::net::UdpSocket) -> Result<()> {
+        let new_addr = socket
+            .local_addr()
+            .context("Failed to get local address of new socket")?;
+        self.endpoint
+            .rebind(socket)
+            .context("Failed to rebind Quinn endpoint to new socket")?;
+        info!(new_addr = %new_addr, "Rebound client endpoint to new socket (connection migration)");
+        Ok(())
+    }
+
     /// Closes the client endpoint.
     pub fn close(&self, error_code: u32, reason: &[u8]) {
         self.endpoint.close(error_code.into(), reason);

@@ -137,6 +137,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_window_resize_and_pty_request_roundtrip() {
+        let resize = ControlMessage::WindowResize {
+            cols: 120,
+            rows: 40,
+            x_pixels: 1920,
+            y_pixels: 1080,
+        };
+        let pty_req = ControlMessage::PtyRequest {
+            term: "xterm-256color".into(),
+            cols: 132,
+            rows: 43,
+            x_pixels: 0,
+            y_pixels: 0,
+        };
+
+        for msg in [resize, pty_req] {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &msg).await.unwrap();
+            let mut reader = Cursor::new(buffer);
+            let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[tokio::test]
     async fn test_auth_frames_roundtrip() {
         use crate::protocol::AuthRequest;
 

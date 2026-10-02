@@ -104,6 +104,23 @@ pub enum ControlMessage {
         echo_timestamp_ms: u64,
     },
 
+    /// Out-of-band terminal window resize event to update remote PTY dimensions.
+    WindowResize {
+        cols: u16,
+        rows: u16,
+        x_pixels: u16,
+        y_pixels: u16,
+    },
+
+    /// Explicit request to allocate a PTY session with specified terminal environment.
+    PtyRequest {
+        term: String,
+        cols: u16,
+        rows: u16,
+        x_pixels: u16,
+        y_pixels: u16,
+    },
+
     /// Graceful disconnect notification.
     Disconnect {
         reason_code: u32,

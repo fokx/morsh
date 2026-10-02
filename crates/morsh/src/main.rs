@@ -51,8 +51,8 @@ struct Args {
     #[arg(long)]
     stealth_knock: Option<String>,
 
-    /// Send N ping packets to measure round-trip latency over QUIC
-    #[arg(long, default_value = "3")]
+    /// Send N ping packets to measure round-trip latency over QUIC (0 starts interactive terminal session)
+    #[arg(long, default_value = "0")]
     ping: u64,
 
     /// Enable verbose debug logging
@@ -330,7 +330,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Ping test if requested
+    use std::io::IsTerminal;
+    let is_tty = std::io::stdin().is_terminal();
+
+    // Ping test if explicitly requested
     if args.ping > 0 {
         println!("Sending {} liveness ping probes...", args.ping);
         for seq in 1..=args.ping {
@@ -359,6 +362,109 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+    } else {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        debug!(cols, rows, "Initial client terminal dimensions");
+
+        // Inform server of initial terminal window dimensions over Stream 0
+        let resize_msg = ControlMessage::WindowResize {
+            cols,
+            rows,
+            x_pixels: 0,
+            y_pixels: 0,
+        };
+        MorshConnection::send_control_message(&mut send, &resize_msg).await?;
+
+        // Open Stream 1 for raw bidirectional PTY byte streaming
+        let (mut pty_send, mut pty_recv) = conn
+            .open_bi()
+            .await
+            .context("Failed to open interactive PTY stream")?;
+
+        let _guard = if is_tty {
+            Some(RawModeGuard::enter()?)
+        } else {
+            None
+        };
+
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+
+        #[cfg(unix)]
+        let mut sigwinch =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                .context("Failed to register SIGWINCH listener")?;
+
+        let mut in_buf = [0u8; 4096];
+        let mut out_buf = [0u8; 4096];
+        let mut stdin_eof = false;
+
+        loop {
+            tokio::select! {
+                // Remote PTY stdout -> local stdout
+                out_res = pty_recv.read(&mut out_buf) => {
+                    match out_res {
+                        Ok(Some(n)) if n > 0 => {
+                            if stdout.write_all(&out_buf[..n]).await.is_err() {
+                                break;
+                            }
+                            let _ = stdout.flush().await;
+                        }
+                        _ => {
+                            debug!("Remote PTY closed output (EOF)");
+                            break;
+                        }
+                    }
+                }
+
+                // Local stdin -> remote PTY stdin
+                in_res = stdin.read(&mut in_buf), if !stdin_eof => {
+                    match in_res {
+                        Ok(n) if n > 0 => {
+                            if pty_send.write_all(&in_buf[..n]).await.is_err() {
+                                stdin_eof = true;
+                            }
+                        }
+                        _ => {
+                            debug!("Local stdin EOF reached; finished PTY send stream");
+                            stdin_eof = true;
+                            let _ = pty_send.finish();
+                        }
+                    }
+                }
+
+                // Terminal window resize signal (SIGWINCH on Unix)
+                _ = sigwinch.recv() => {
+                    let (new_cols, new_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let resize_event = ControlMessage::WindowResize {
+                        cols: new_cols,
+                        rows: new_rows,
+                        x_pixels: 0,
+                        y_pixels: 0,
+                    };
+                    let _ = MorshConnection::send_control_message(&mut send, &resize_event).await;
+                }
+
+                // Control stream notifications (e.g. Disconnect or Ping)
+                ctrl_res = MorshConnection::read_control_message(&mut recv) => {
+                    match ctrl_res {
+                        Ok(ControlMessage::Disconnect { reason_code, message }) => {
+                            debug!(code = reason_code, %message, "Server notified disconnect");
+                            break;
+                        }
+                        Ok(ControlMessage::Ping { seq, timestamp_ms }) => {
+                            let pong = ControlMessage::Pong { seq, echo_timestamp_ms: timestamp_ms };
+                            let _ = MorshConnection::send_control_message(&mut send, &pong).await;
+                        }
+                        _ => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Graceful disconnect
@@ -371,8 +477,30 @@ async fn main() -> Result<()> {
     let _ = send.finish();
 
     conn.close(0, "normal client exit");
-    println!("Session cleanly terminated.");
+    if !is_tty && args.ping > 0 {
+        println!("Session cleanly terminated.");
+    }
     Ok(())
+}
+
+/// RAII guard ensuring terminal raw mode is cleanly disabled when dropped.
+struct RawModeGuard {
+    active: bool,
+}
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("Failed to enable raw terminal mode")?;
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
 }
 
 #[cfg(test)]

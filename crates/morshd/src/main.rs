@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use morsh_auth::{generate_challenge, AuthorizedKeys, PamAuthenticator, PasswordVerifier};
 use morsh_core::protocol::{AuthMethod, AuthRequest, ControlMessage, PROTOCOL_VERSION};
+use morsh_term::{PtyConfig, PtyHandle, PtySession};
 use morsh_transport::{
     cert_fingerprint_sha256, generate_self_signed_cert, generate_session_id, make_server_config,
     MorshConnection, QuicServer,
@@ -363,7 +364,110 @@ async fn handle_connection(
         "User session authorized; entering control loop"
     );
 
-    // Control stream loop: handle heartbeats and control commands
+    // Shared state for PTY session
+    let pty_handle: Arc<tokio::sync::Mutex<Option<PtyHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let initial_dims: Arc<tokio::sync::Mutex<(u16, u16)>> =
+        Arc::new(tokio::sync::Mutex::new((80, 24)));
+    let initial_term: Arc<tokio::sync::Mutex<String>> =
+        Arc::new(tokio::sync::Mutex::new("xterm-256color".into()));
+
+    let (pty_shutdown_tx, mut pty_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let pty_handle_for_accept = Arc::clone(&pty_handle);
+    let initial_dims_for_accept = Arc::clone(&initial_dims);
+    let initial_term_for_accept = Arc::clone(&initial_term);
+    let auth_user_clone = authenticated_user.clone();
+    let conn_clone = conn.clone();
+
+    // Spawn supervisor for Stream 1 (Interactive PTY raw byte stream)
+    let pty_task = tokio::spawn(async move {
+        tokio::select! {
+            accept_res = conn_clone.accept_bi() => {
+                match accept_res {
+                    Ok((mut pty_send, mut pty_recv)) => {
+                        let (cols, rows) = *initial_dims_for_accept.lock().await;
+                        let term = initial_term_for_accept.lock().await.clone();
+                        let mut cfg = PtyConfig {
+                            cols,
+                            rows,
+                            term,
+                            ..Default::default()
+                        };
+                        if auth_user_clone != "unauthenticated" {
+                            cfg.user = Some(auth_user_clone.clone());
+                        }
+
+                        match PtySession::spawn(&cfg) {
+                            Ok(session) => {
+                                info!(user = %auth_user_clone, cols, rows, "Interactive PTY allocated successfully");
+                                let (handle, mut pty_reader, mut pty_writer) = session.split();
+                                *pty_handle_for_accept.lock().await = Some(handle.clone());
+
+                                // Pipe PTY stdout -> Stream 1 writer
+                                let pty_out = tokio::spawn(async move {
+                                    use tokio::io::AsyncReadExt;
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match pty_reader.read(&mut buf).await {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                if pty_send.write_all(&buf[..n]).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    let _ = pty_send.finish();
+                                    debug!("PTY stdout closed");
+                                });
+
+                                // Pipe Stream 1 reader -> PTY stdin
+                                let pty_in = tokio::spawn(async move {
+                                    use tokio::io::AsyncWriteExt;
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match pty_recv.read(&mut buf).await {
+                                            Ok(Some(n)) if n > 0 => {
+                                                if pty_writer.write_all(&buf[..n]).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    debug!("PTY stdin closed");
+                                });
+
+                                tokio::select! {
+                                    _ = pty_out => {
+                                        debug!("PTY process exited; output closed");
+                                    }
+                                    _ = &mut pty_shutdown_rx => {
+                                        debug!("PTY session received shutdown signal");
+                                    }
+                                }
+
+                                pty_in.abort();
+                                let _ = handle.kill();
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to spawn PTY session");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "No interactive PTY stream initiated by peer");
+                    }
+                }
+            }
+            _ = &mut pty_shutdown_rx => {
+                debug!("Cancelled PTY accept waiting");
+            }
+        }
+    });
+
+    // Control stream loop: handle heartbeats, window resize, and control commands
     loop {
         tokio::select! {
             msg_res = MorshConnection::read_control_message(&mut recv) => {
@@ -374,6 +478,23 @@ async fn handle_connection(
                         if let Err(e) = MorshConnection::send_control_message(&mut send, &pong).await {
                             warn!(peer = %peer_addr, error = %e, "Failed to send pong");
                             break;
+                        }
+                    }
+                    Ok(ControlMessage::WindowResize { cols, rows, .. }) => {
+                        *initial_dims.lock().await = (cols, rows);
+                        if let Some(ref handle) = *pty_handle.lock().await {
+                            if let Err(e) = handle.resize(cols, rows) {
+                                warn!(peer = %peer_addr, error = %e, "Failed to resize PTY");
+                            } else {
+                                debug!(peer = %peer_addr, cols, rows, "Resized remote PTY");
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::PtyRequest { term, cols, rows, .. }) => {
+                        *initial_dims.lock().await = (cols, rows);
+                        *initial_term.lock().await = term;
+                        if let Some(ref handle) = *pty_handle.lock().await {
+                            let _ = handle.resize(cols, rows);
                         }
                     }
                     Ok(ControlMessage::Disconnect { reason_code, message }) => {
@@ -396,6 +517,9 @@ async fn handle_connection(
             }
         }
     }
+
+    let _ = pty_shutdown_tx.send(());
+    let _ = pty_task.await;
 
     let _ = send.finish();
     info!(peer = %peer_addr, session = %session_hex, user = %authenticated_user, "Session terminated");

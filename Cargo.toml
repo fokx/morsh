@@ -46,3 +46,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2.0"
 anyhow = "1.0"
+
+# Terminal & PTY
+portable-pty = "0.9"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"

@@ -7,4 +7,12 @@ authors.workspace = true
 
 [dependencies]
 morsh-core.workspace = true
+portable-pty.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+morsh-transport.workspace = true

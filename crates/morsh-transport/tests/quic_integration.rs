@@ -308,3 +308,66 @@ async fn test_version_mismatch_rejection() {
     client_conn.close(1, "client close");
     timeout(Duration::from_secs(5), server_task).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn test_quic_connection_migration() {
+    let (server, server_addr) = setup_test_server();
+    let client = setup_test_client();
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().unwrap();
+        let initial_remote = conn.remote_address();
+
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+
+        // 1. Read first ping before migration
+        let msg1 = MorshConnection::read_control_message(&mut recv).await.unwrap();
+        assert_eq!(msg1, ControlMessage::Ping { seq: 1, timestamp_ms: 100 });
+        MorshConnection::send_control_message(&mut send, &ControlMessage::Pong { seq: 1, echo_timestamp_ms: 100 }).await.unwrap();
+
+        // 2. Read second ping after client rebind / migration
+        let msg2 = MorshConnection::read_control_message(&mut recv).await.unwrap();
+        assert_eq!(msg2, ControlMessage::Ping { seq: 2, timestamp_ms: 200 });
+        MorshConnection::send_control_message(&mut send, &ControlMessage::Pong { seq: 2, echo_timestamp_ms: 200 }).await.unwrap();
+
+        // Verify the connection migrated: remote address updated or matches new socket
+        let final_remote = conn.remote_address();
+        assert_ne!(initial_remote, final_remote, "Connection remote address should update upon client migration");
+
+        let _ = send.finish();
+        let _ = conn.inner().closed().await;
+    });
+
+    let client_conn = client.connect(server_addr, "localhost").await.unwrap();
+    let initial_client_addr = client.local_addr().unwrap();
+    let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
+
+    // Send first ping
+    let ping1 = ControlMessage::Ping { seq: 1, timestamp_ms: 100 };
+    MorshConnection::send_control_message(&mut send, &ping1).await.unwrap();
+    let pong1 = MorshConnection::read_control_message(&mut recv).await.unwrap();
+    assert_eq!(pong1, ControlMessage::Pong { seq: 1, echo_timestamp_ms: 100 });
+
+    // Simulate IP/interface roaming: rebind client UDP endpoint to a new socket
+    let new_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let new_client_addr = new_sock.local_addr().unwrap();
+    assert_ne!(initial_client_addr, new_client_addr);
+
+    client.rebind(new_sock).unwrap();
+    assert_eq!(client.local_addr().unwrap(), new_client_addr);
+
+    // Give a brief moment for socket swap
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send second ping over existing stream on existing connection
+    let ping2 = ControlMessage::Ping { seq: 2, timestamp_ms: 200 };
+    MorshConnection::send_control_message(&mut send, &ping2).await.unwrap();
+    let pong2 = MorshConnection::read_control_message(&mut recv).await.unwrap();
+    assert_eq!(pong2, ControlMessage::Pong { seq: 2, echo_timestamp_ms: 200 });
+
+    // Clean disconnect
+    let _ = send.finish();
+    client_conn.close(0, "client done");
+
+    timeout(Duration::from_secs(5), server_task).await.unwrap().unwrap();
+}

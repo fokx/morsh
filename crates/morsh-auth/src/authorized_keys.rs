@@ -99,14 +99,13 @@ impl AuthorizedKeys {
     /// Resolves the candidate path for a user's `authorized_keys` file.
     pub fn locate_authorized_keys_for_user(username: &str) -> Result<PathBuf> {
         // If current user matches requested user, check $HOME/.ssh/authorized_keys
-        if let Ok(current_user) = std::env::var("USER") {
-            if current_user == username {
-                if let Ok(home) = std::env::var("HOME") {
-                    let p = PathBuf::from(home).join(".ssh").join("authorized_keys");
-                    if p.exists() {
-                        return Ok(p);
-                    }
-                }
+        if let Ok(current_user) = std::env::var("USER")
+            && current_user == username
+            && let Ok(home) = std::env::var("HOME")
+        {
+            let p = PathBuf::from(home).join(".ssh").join("authorized_keys");
+            if p.exists() {
+                return Ok(p);
             }
         }
 

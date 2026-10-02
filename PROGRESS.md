@@ -12,8 +12,8 @@
 |---|---|---|---|---|---|
 | **Phase 1** | Workspace Foundation & Core QUIC Transport | ✅ **Completed** | 2026-10-05 | `dcf1e0d` | Workspace, `morsh-core`, `morsh-transport`, `morshd`, `morsh` CLI, 17 tests |
 | **Phase 2** | Stealth Security & Authentication Layer | ✅ **Completed** | 2026-10-05 | - | `morsh-auth`, SSH keys (Ed25519/RSA/ECDSA), `authorized_keys`, `ssh-agent`, PAM, 33 tests |
-| **Phase 3** | Interactive PTY & QUIC Connection Migration | 🎯 **Active / Next** | Pending | - | PTY allocation (`portable-pty`), `crossterm` raw mode, `SIGWINCH`, IP roaming |
-| **Phase 4** | Port Forwarding & Tunnels (TCP, UDP, SOCKS5) | ⏳ Pending | - | - | `-L`, `-R`, native UDP forwarding, `-D` SOCKS5 proxy |
+| **Phase 3** | Interactive PTY & QUIC Connection Migration | ✅ **Completed** | 2026-10-05 | - | `morsh-term`, `portable-pty`, `crossterm` raw mode, `SIGWINCH` resize, IP roaming, 38 tests |
+| **Phase 4** | Port Forwarding & Tunnels (TCP, UDP, SOCKS5) | 🎯 **Active / Next** | Pending | - | `-L`, `-R`, native UDP forwarding, `-D` SOCKS5 proxy |
 | **Phase 5** | Session Persistence & Screen State Recovery | ⏳ Pending | - | - | Detached PTY supervisor, 128-bit session tokens, `vt100` state sync |
 | **Phase 6** | Predictive Local Echo & Speculative UI | ⏳ Pending | - | - | Speculative keystroke echo, underline styling, 1-RTT rollback |
 | **Phase 7** | TCP Fallback & Network Resilience | ⏳ Pending | - | - | Happy Eyeballs auto-detection, TLS 1.3 over TCP fallback |
@@ -138,50 +138,119 @@
 
 ---
 
-## 4. Phase 3 Action Plan (Handoff Instructions)
+## 4. Phase 3 Completion Record
 
-When beginning a new conversation to implement **Phase 3: Interactive PTY & QUIC Connection Migration (Roaming)**:
+### Delivered Components
+1. **Wire Protocol Terminal Extensions (`crates/morsh-core`)**:
+   - `protocol::ControlMessage::WindowResize`: Out-of-band terminal window resize event with `cols`, `rows`, `x_pixels`, and `y_pixels`.
+   - `protocol::ControlMessage::PtyRequest`: Client terminal request specifying `term` environment string and initial window dimensions.
+   - Channel map enforced:
+     - **Stream 0 (Bi)**: Control stream (`ControlMessage` binary frames with Postcard serialization).
+     - **Stream 1 (Bi)**: Interactive raw PTY byte stream (`StreamChannelKind::Pty`).
+   - Frame serialization roundtrip unit tests in `crates/morsh-core/src/frame.rs`.
 
-### Primary Objective
-Deliver a responsive, raw terminal interactive shell with pseudo-terminal allocation on the server, raw input forwarding on the client, dynamic window resizing (`SIGWINCH`), and verify QUIC connection migration (seamless IP/interface roaming without session reset).
+2. **Terminal & PTY Subsystem (`crates/morsh-term`)**:
+   - **`PtySession` & `PtyHandle` (`src/pty.rs`)**:
+     - Pseudo-terminal allocation via `portable-pty 0.9` (`native_pty_system().openpty()`).
+     - Automatic shell discovery via `resolve_shell` scanning `$SHELL`, `/etc/passwd` (`libc::getpwnam`), and standard system shells (`/bin/bash`, `/usr/bin/bash`, `/bin/zsh`, `/bin/sh`).
+     - Environment setup: `TERM`, `COLORTERM=truecolor`, `USER`, `LOGNAME`, `SHELL`, and custom environment variables.
+     - Out-of-band window resize propagation via `MasterPty::resize` (`TIOCSWINSZ` / `SIGWINCH`).
+     - Process lifecycle management (`kill`, `wait`, `try_wait`, `process_id`).
+   - **Async I/O Bridge (`src/io.rs`)**:
+     - `AsyncPtyReader`: Dedicated background reader thread feeding `tokio::sync::mpsc` channel; implements `tokio::io::AsyncRead`.
+     - `AsyncPtyWriter`: Dedicated background writer thread receiving from `tokio::sync::mpsc::UnboundedSender`; implements `tokio::io::AsyncWrite`.
+     - Clean handling of Linux PTY `EIO` (errno 5) as EOF upon slave closure.
 
-### Prerequisites & Dependencies
-- Crates to implement: `crates/morsh-term`
-- Dependencies to add:
-  - Server PTY allocation: `portable-pty = "0.8"` (cross-platform pseudo-terminal allocation) or Unix `nix` / `termios`.
-  - Client raw mode: `crossterm = { version = "0.28", features = ["event-stream"] }` (raw mode, terminal events).
-  - Out-of-band signals: `tokio::signal` (client `SIGWINCH` listening on Unix).
+3. **Daemon Integration (`crates/morshd`)**:
+   - Multi-stream supervisor: accepts Stream 0 for control loop, accepts Stream 1 (`conn.accept_bi()`) for interactive PTY byte streaming.
+   - Pipes remote PTY stdout -> Stream 1 writer, and Stream 1 reader -> remote PTY stdin.
+   - Dynamically updates PTY window dimensions on incoming `ControlMessage::WindowResize` frames.
+   - PTY process decoupling: when client input finishes (half-close), the PTY process continues running until its stdout closes naturally, supporting pipe workflows (e.g. `printf "cmd\n" | morsh host`).
 
-### Step-by-Step Task Breakdown
-1. **Extend Wire Protocol in `crates/morsh-core/src/protocol.rs`**:
-   - Add terminal window resize frame to `ControlMessage`:
-     - `ControlMessage::WindowResize { cols: u16, rows: u16, x_pixels: u16, y_pixels: u16 }`
-   - Add stream channel mapping:
-     - Stream 0: Control & resize events (`ControlMessage`).
-     - Stream 1: Bidirectional raw PTY byte stream (interactive stdin / stdout).
-2. **Implement `crates/morsh-term`**:
-   - `PtyMaster`: Spawns user's default login shell (`$SHELL`, `/bin/bash`, or `/bin/sh`) inside an allocated pseudo-terminal with slave PTY.
-   - Provides async reader and writer wrappers over the PTY master file descriptors.
-   - `PtyMaster::resize(&self, cols: u16, rows: u16)`: Propagates window size changes (`TIOCSWINSZ` / `SIGWINCH`) to the running shell child process.
-3. **Integrate PTY in `morshd`**:
-   - Upon successful client authentication, spawn a `PtyMaster` session.
-   - Accept Stream 1 (`conn.accept_bi()`) and pipe PTY stdout -> Stream 1 writer, and Stream 1 reader -> PTY stdin.
-   - On Stream 0, handle incoming `ControlMessage::WindowResize` frames by calling `pty.resize()`.
-   - Monitor child process exit status and send graceful `Disconnect` or close Stream 1 on shell exit.
-4. **Integrate Raw Mode in `morsh` Client CLI**:
-   - Enable crossterm terminal raw mode upon connection: `terminal::enable_raw_mode()`.
-   - Open Stream 1 (`conn.open_bi()`) for raw PTY byte streaming.
-   - Spawn input forwarder: read stdin bytes -> Stream 1 writer.
-   - Spawn output forwarder: read Stream 1 bytes -> stdout.
-   - Listen for terminal resize events (`crossterm::event::Event::Resize(cols, rows)`) and send `ControlMessage::WindowResize` over Stream 0.
-   - Ensure clean terminal cleanup hook on exit (restore raw mode, show cursor).
-5. **Verify QUIC Connection Migration (Roaming)**:
-   - Verify that Quinn handles client socket migration (e.g. rebinding client UDP socket or switching IP/interface) while interactive PTY Stream 1 and Control Stream 0 persist without reset.
-   - Add automated test verifying stream data survives migration.
+4. **Client CLI Integration (`crates/morsh`)**:
+   - Added `crossterm 0.28` raw mode management with RAII `RawModeGuard` ensuring terminal restoration on exit or error.
+   - Detects TTY vs. piped execution via `std::io::stdin().is_terminal()`.
+   - Opens Stream 1 for raw terminal I/O and forwards `stdin` <-> Stream 1 <-> `stdout`.
+   - On Unix, registers `tokio::signal::unix::SignalKind::window_change()` to catch `SIGWINCH` and emit `ControlMessage::WindowResize` frames over Stream 0.
+   - Selective polling in `tokio::select!` (`if !stdin_eof`) allowing clean half-close execution for non-interactive scripts.
+
+5. **QUIC Connection Migration (Roaming) (`crates/morsh-transport`)**:
+   - Implemented `QuicClient::rebind(&self, socket: std::net::UdpSocket)` to dynamically switch local UDP sockets on active Quinn client endpoints.
+   - Quinn Connection IDs (CID) allow the server to validate path migration without connection resets.
+   - Verified that active interactive streams (Stream 0, Stream 1) survive socket rebinding, and server dynamically tracks updated remote client address.
+
+6. **Architectural Choices & Tradeoffs Recorded**:
+   - **Dedicated OS Threads for PTY I/O**: Master PTY file descriptors on Unix exhibit subtle epoll edge-trigger quirks with `EIO` signaling upon slave process termination. Spawning dedicated reader and writer OS threads bridging to Tokio channels guarantees portable, non-blocking async execution across Linux, macOS, and Windows.
+   - **Linux `EIO` As EOF**: On Linux, reading from a master PTY returns `io::Error(kind: Os(5) / EIO)` when the child process exits and closes all slave PTY descriptors. `AsyncPtyReader` intercepts this error and treats it as a clean EOF rather than an I/O failure.
+   - **Out-of-band Window Resizing over Stream 0**: By transmitting `ControlMessage::WindowResize` frames over Stream 0 rather than embedding in-band escape sequences into Stream 1, the interactive PTY channel remains a 100% pure binary byte stream with zero framing overhead or parsing ambiguities.
+   - **Preconditioned Select for Stdin Half-Close**: When local stdin reaches EOF in piped mode, `morsh` client marks `stdin_eof = true`, calls `pty_send.finish()`, and disables the stdin branch in `tokio::select!` using guard preconditions. This prevents busy loops and enables the remote shell to finish writing its output before client exit.
+
+7. **Automated Test Suite (38 Tests Passing Workspace-wide)**:
+   - **`morsh-term` Unit Tests (5 passed)**:
+     - `test_resolve_default_shell`: Resolves system shell and respects explicit overrides.
+     - `test_pty_resize`: Verifies PTY window resize (`cols` and `rows`) and pixel resize propagation.
+     - `test_pty_write_and_echo`: Verifies raw byte writing and echo back from `cat`.
+     - `test_pty_spawn_and_read_output`: Verifies shell command execution and output capture.
+     - `test_pty_kill_and_status`: Verifies process kill signaling and status inspection.
+   - **`morsh-term` Integration Tests (`tests/term_integration.rs`, 2 passed)**:
+     - `test_interactive_pty_over_quic_streams`: Full live QUIC exchange with Stream 0 control, Stream 1 raw PTY piping, out-of-band `WindowResize`, and clean exit.
+     - `test_pty_session_persists_across_quic_connection_migration`: Full live test proving interactive PTY stream survives client UDP socket rebinding (roaming) without stream reset.
+   - **`morsh-transport` Integration Tests (`tests/quic_integration.rs`, 6 passed)**:
+     - `test_quic_connection_migration`: Quinn client endpoint rebinding with active stream transmission and server remote address verification.
+   - **Live CLI End-to-End Verification**:
+     - Started live `morshd` daemon on UDP/QUIC port `4545`.
+     - Executed live `morsh` CLI with interactive shell piping (`printf "echo LIVE_PTY_SHELL_OK\nexit\n"`).
+     - Verified user's login shell (zsh) spawned inside pseudo-terminal, executed commands, printed prompt and output, and exited cleanly in ~200 ms.
 
 ---
 
-## 5. Work Log (Append History)
+## 5. Phase 4 Action Plan (Handoff Instructions)
+
+When beginning a new conversation to implement **Phase 4: Port Forwarding & Tunnels (TCP, UDP, SOCKS5)**:
+
+### Primary Objective
+Implement local TCP port forwarding (`-L`), remote TCP port forwarding (`-R`), dynamic SOCKS5 proxying (`-D`), and native UDP forwarding over QUIC streams and RFC 9221 datagrams.
+
+### Prerequisites & Dependencies
+- Crates to implement: `crates/morsh-tunnel`
+- Workspace crates to integrate: `morsh-core`, `morsh-transport`, `morshd`, `morsh`
+- Dependencies to consider:
+  - `tokio = { workspace = true }` (TCP listeners, UDP sockets, streams)
+  - `async-socks5` or lightweight native SOCKS5 RFC 1928 handshake parser in `morsh-tunnel`.
+
+### Step-by-Step Task Breakdown
+1. **Extend Wire Protocol in `crates/morsh-core/src/protocol.rs`**:
+   - Add tunnel control frames to `ControlMessage`:
+     - `TunnelOpenRequest { tunnel_id: u32, tunnel_type: TunnelType, host: String, port: u16 }`
+     - `TunnelOpenResponse { tunnel_id: u32, success: bool, message: String }`
+     - `TunnelClose { tunnel_id: u32 }`
+   - Define `TunnelType`: `LocalTcp`, `RemoteTcp`, `Socks5`, `UdpForward`.
+2. **Implement `crates/morsh-tunnel`**:
+   - **Local Forwarding Engine (`-L`)**:
+     - Binds local `tokio::net::TcpListener` on client.
+     - On incoming client TCP connection: requests tunnel stream from server, opens bidirectional QUIC stream (`StreamChannelKind::TcpForward`), and bridges bytes.
+   - **Remote Forwarding Engine (`-R`)**:
+     - Server binds `TcpListener` on remote network.
+     - On incoming remote TCP connection: opens bidirectional QUIC stream to client, bridges to client target host/port.
+   - **Dynamic SOCKS5 Proxy Engine (`-D`)**:
+     - Integrated SOCKS5 proxy server (RFC 1928, `NO_AUTH` method) listening locally on client.
+     - Parses `CONNECT` requests for IPv4, IPv6, and domain names, forwarding target connections through QUIC streams.
+   - **Native UDP Port Forwarding**:
+     - Binds local `UdpSocket`, forwards packets via QUIC Datagrams (RFC 9221) or low-latency streams.
+3. **Integrate into `morshd` and `morsh` CLIs**:
+   - Add CLI arguments to `morsh`:
+     - `-L, --local-forward <[bind_addr:]bind_port:target_host:target_port>`
+     - `-R, --remote-forward <[bind_addr:]bind_port:target_host:target_port>`
+     - `-D, --dynamic-forward <[bind_addr:]bind_port>`
+     - `-N, --no-shell` (do not allocate interactive PTY, tunnel mode only).
+   - Add corresponding listener daemon handling in `morshd`.
+4. **Verification & Tests**:
+   - Add unit tests in `morsh-tunnel` covering SOCKS5 handshake parsing and tunnel frame codecs.
+   - Add integration tests verifying live TCP port forwarding and SOCKS5 proxy requests through active QUIC sessions.
+
+---
+
+## 6. Work Log (Append History)
 
 ### 2026-10-05 — Phase 1 Completed
 - Initialized multi-crate workspace (`morsh-core`, `morsh-transport`, `morsh-auth`, `morsh-term`, `morsh-predict`, `morsh-tunnel`, `morshd`, `morsh`).
@@ -202,4 +271,18 @@ Deliver a responsive, raw terminal interactive shell with pseudo-terminal alloca
 - Integrated authentication flows into `morshd` daemon and `morsh` client CLI with automatic key discovery and fallback cascade.
 - Added 15 new tests (11 unit tests in `morsh-auth`, 4 integration tests in `auth_integration.rs`), reaching 33 passing tests workspace-wide.
 - Conducted live end-to-end CLI verification: sub-3ms authenticated handshake, stealth knock verification, and unauthorized probe rejection.
+
+### 2026-10-05 — Phase 3 Completed
+- Implemented Phase 3 interactive PTY subsystem, raw terminal mode, window resize propagation, and QUIC connection migration across `morsh-core`, `morsh-term`, `morsh-transport`, `morshd`, and `morsh`.
+- Added `ControlMessage::WindowResize` and `ControlMessage::PtyRequest` wire frames to `morsh-core`.
+- Built `morsh-term` pseudo-terminal subsystem using `portable-pty 0.9`:
+  - `PtySession` and `PtyHandle` managing slave shell allocation and window resize propagation (`TIOCSWINSZ` / `SIGWINCH`).
+  - `AsyncPtyReader` implementing `tokio::io::AsyncRead` with dedicated worker thread and Linux `EIO` handling.
+  - `AsyncPtyWriter` implementing `tokio::io::AsyncWrite` with non-blocking Tokio unbounded channels.
+  - Automatic login shell resolution inspecting `$SHELL`, `/etc/passwd`, and candidate shells.
+- Integrated interactive raw mode in `morsh` client CLI with `crossterm 0.28`, RAII `RawModeGuard`, out-of-band `SIGWINCH` listening on Unix, and input half-close support for pipeline commands.
+- Integrated PTY session supervisor in `morshd` daemon multiplexing Stream 0 (Control) and Stream 1 (PTY raw stream) with decoupled process lifecycles.
+- Implemented and verified QUIC connection migration (IP roaming) via `QuicClient::rebind`: proved active interactive PTY sessions survive UDP socket rebinding with server dynamically tracking updated remote address.
+- Added 5 new unit tests in `morsh-term`, 2 integration tests in `term_integration.rs`, and 1 migration integration test in `quic_integration.rs`, reaching 38 passing tests workspace-wide with 0 warnings.
+- Verified live end-to-end interactive execution with `morshd` and `morsh` running the user's login shell inside a pseudo-terminal.
 
