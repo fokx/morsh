@@ -69,6 +69,8 @@ pub enum ControlMessage {
         server_software: String,
         /// Unique session identifier generated or resumed for this connection.
         session_id: [u8; 16],
+        /// Cryptographic 128-bit session resumption token (Mosh style).
+        resumption_token: [u8; 16],
         /// Authentication methods accepted by this server.
         supported_auth: Vec<AuthMethod>,
         /// Whether this is a successfully resumed persistent session.
@@ -121,11 +123,162 @@ pub enum ControlMessage {
         y_pixels: u16,
     },
 
+    /// Client indicates that no interactive PTY shell should be allocated (-N / tunnel-only mode).
+    NoShell,
+
+    /// Voluntary detach request from client: leaves server PTY running in background.
+    SessionDetachRequest,
+
+    /// Request to resume an existing detached persistent session.
+    SessionResumeRequest {
+        session_id: [u8; 16],
+        resumption_token: [u8; 16],
+    },
+
+    /// Server response acknowledging or rejecting session resumption.
+    SessionResumeResponse {
+        success: bool,
+        session_id: [u8; 16],
+        resumption_token: [u8; 16],
+        message: String,
+    },
+
+    /// Request to list all active persistent sessions for the authenticated user.
+    SessionListRequest,
+
+    /// List of active persistent sessions on the server.
+    SessionListResponse {
+        sessions: Vec<SessionInfo>,
+    },
+
+    /// Full terminal screen state snapshot transmitted on reconnection to restore terminal display.
+    ScreenSnapshot {
+        cols: u16,
+        rows: u16,
+        cursor_x: u16,
+        cursor_y: u16,
+        buffer: Vec<u8>,
+    },
+
+    /// Incremental screen update delta.
+    ScreenDelta {
+        seq: u64,
+        delta: Vec<u8>,
+    },
+
+    /// Request to initiate a new forwarded tunnel channel.
+    TunnelOpenRequest {
+        tunnel_id: u32,
+        tunnel_type: TunnelType,
+        host: String,
+        port: u16,
+    },
+
+    /// Response acknowledging or rejecting a tunnel open request.
+    TunnelOpenResponse {
+        tunnel_id: u32,
+        success: bool,
+        message: String,
+    },
+
+    /// Notification that a tunnel channel has been terminated.
+    TunnelClose {
+        tunnel_id: u32,
+    },
+
+    /// Request by client for server to bind a remote port for remote forwarding (-R).
+    RemoteForwardRequest {
+        bind_addr: String,
+        bind_port: u16,
+        target_host: String,
+        target_port: u16,
+    },
+
+    /// Response acknowledging or rejecting remote port binding (-R).
+    RemoteForwardResponse {
+        bind_port: u16,
+        success: bool,
+        message: String,
+    },
+
+    /// Predictive local echo input sequence notification sent by client.
+    PredictInputSeq {
+        seq: u64,
+        len: u32,
+    },
+
+    /// Predictive local echo sequence acknowledgement sent by server.
+    PredictAck {
+        ack_seq: u64,
+    },
+
     /// Graceful disconnect notification.
     Disconnect {
         reason_code: u32,
         message: String,
     },
+}
+
+/// Metadata describing an active persistent session on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: [u8; 16],
+    pub user: String,
+    pub created_at_secs: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub is_attached: bool,
+}
+
+/// Type of network tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TunnelType {
+    /// Local TCP forward (-L): client listens locally, server connects to remote target.
+    LocalTcp,
+    /// Remote TCP forward (-R): server listens remotely, client connects to local network target.
+    RemoteTcp,
+    /// Dynamic SOCKS5 proxy (-D): client runs SOCKS5 proxy, server connects to requested destination.
+    Socks5,
+    /// Native UDP forward: bidirectional packet forwarding over QUIC Datagrams.
+    UdpForward,
+}
+
+/// 4-byte magic preamble for tunnel QUIC streams.
+pub const TUNNEL_STREAM_MAGIC: [u8; 4] = *b"MTUN";
+
+/// Preamble sent at the start of a forwarded QUIC stream.
+/// Identifies which tunnel_id the stream belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelStreamPreamble {
+    pub magic: [u8; 4],
+    pub tunnel_id: u32,
+}
+
+impl TunnelStreamPreamble {
+    pub fn new(tunnel_id: u32) -> Self {
+        Self {
+            magic: TUNNEL_STREAM_MAGIC,
+            tunnel_id,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        bytes[0..4].copy_from_slice(&self.magic);
+        bytes[4..8].copy_from_slice(&self.tunnel_id.to_be_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8; 8]) -> Option<Self> {
+        if &bytes[0..4] != &TUNNEL_STREAM_MAGIC {
+            return None;
+        }
+        let tunnel_id = u32::from_be_bytes(bytes[4..8].try_into().ok()?);
+        Some(Self {
+            magic: TUNNEL_STREAM_MAGIC,
+            tunnel_id,
+        })
+    }
 }
 
 /// Helper to construct the canonical challenge payload to be signed by SSH key or agent.

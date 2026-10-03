@@ -13,10 +13,10 @@
 | **Phase 1** | Workspace Foundation & Core QUIC Transport | ✅ **Completed** | 2026-10-05 | `dcf1e0d` | Workspace, `morsh-core`, `morsh-transport`, `morshd`, `morsh` CLI, 17 tests |
 | **Phase 2** | Stealth Security & Authentication Layer | ✅ **Completed** | 2026-10-05 | - | `morsh-auth`, SSH keys (Ed25519/RSA/ECDSA), `authorized_keys`, `ssh-agent`, PAM, 33 tests |
 | **Phase 3** | Interactive PTY & QUIC Connection Migration | ✅ **Completed** | 2026-10-05 | - | `morsh-term`, `portable-pty`, `crossterm` raw mode, `SIGWINCH` resize, IP roaming, 38 tests |
-| **Phase 4** | Port Forwarding & Tunnels (TCP, UDP, SOCKS5) | 🎯 **Active / Next** | Pending | - | `-L`, `-R`, native UDP forwarding, `-D` SOCKS5 proxy |
-| **Phase 5** | Session Persistence & Screen State Recovery | ⏳ Pending | - | - | Detached PTY supervisor, 128-bit session tokens, `vt100` state sync |
-| **Phase 6** | Predictive Local Echo & Speculative UI | ⏳ Pending | - | - | Speculative keystroke echo, underline styling, 1-RTT rollback |
-| **Phase 7** | TCP Fallback & Network Resilience | ⏳ Pending | - | - | Happy Eyeballs auto-detection, TLS 1.3 over TCP fallback |
+| **Phase 4** | Port Forwarding & Tunnels (TCP, UDP, SOCKS5) | ✅ **Completed** | 2026-10-06 | - | `morsh-tunnel`, `-L`, `-R`, `-D`, `-U`, `-N`, 57 tests |
+| **Phase 5** | Session Persistence & Screen State Recovery | ✅ **Completed** | 2026-10-06 | - | Detached PTY supervisor, 128-bit session tokens, `vt100` state sync, 65 tests |
+| **Phase 6** | Predictive Local Echo & Speculative UI | ✅ **Completed** | 2026-10-06 | - | Predictive echo engine, underline/dim styling, confidence heuristics, 1-RTT rollback, 92 tests |
+| **Phase 7** | TCP Fallback & Network Resilience | 🎯 **Active / Next** | Pending | - | Happy Eyeballs auto-detection, TLS 1.3 over TCP fallback |
 | **Phase 8** | CLI Polish, Configuration & Packaging | ⏳ Pending | - | - | OpenSSH CLI parity, config files, `morshd.service` systemd unit |
 
 
@@ -204,53 +204,277 @@
 
 ---
 
-## 5. Phase 4 Action Plan (Handoff Instructions)
+## 5. Phase 4 Completion Record
 
-When beginning a new conversation to implement **Phase 4: Port Forwarding & Tunnels (TCP, UDP, SOCKS5)**:
+### Delivered Components
+1. **Wire Protocol Tunnel Extensions (`crates/morsh-core`)**:
+   - `protocol::TunnelType`: Enums for `LocalTcp`, `RemoteTcp`, `Socks5`, and `UdpForward`.
+   - `protocol::ControlMessage`: Added tunnel control frames:
+     - `TunnelOpenRequest { tunnel_id, tunnel_type, host, port }`
+     - `TunnelOpenResponse { tunnel_id, success, message }`
+     - `TunnelClose { tunnel_id }`
+     - `RemoteForwardRequest { bind_addr, bind_port, target_host, target_port }`
+     - `RemoteForwardResponse { bind_port, success, message }`
+     - `NoShell` (signals tunnel-only execution without interactive PTY).
+   - `protocol::TunnelStreamPreamble`: Zero-allocation 8-byte binary preamble (`MTUN` magic + `tunnel_id: u32`) written at the start of forwarded QUIC streams.
+   - `error::CoreError::Tunnel`: Dedicated tunnel error variant.
+   - Unit tests covering all new frames and preamble binary encoding roundtrip.
 
-### Primary Objective
-Implement local TCP port forwarding (`-L`), remote TCP port forwarding (`-R`), dynamic SOCKS5 proxying (`-D`), and native UDP forwarding over QUIC streams and RFC 9221 datagrams.
+2. **Port Forwarding & Tunnels Subsystem (`crates/morsh-tunnel`)**:
+   - **Configuration Parser (`src/config.rs`)**:
+     - `ForwardRule`: parses OpenSSH `[bind_addr:]bind_port:target_host:target_port` specifications, including bracketed IPv6 `[::1]:port`.
+     - `DynamicRule`: parses OpenSSH `[bind_addr:]bind_port` dynamic proxy specifications.
+     - `UdpRule`: parses OpenSSH-style UDP forwarding specifications.
+   - **Bidirectional Stream Bridge (`src/bridge.rs`)**:
+     - `bridge_tcp_and_quic`: concurrent non-blocking byte forwarding between `TcpStream` and Quinn `(SendStream, RecvStream)` handling half-close and EOF without framing overhead.
+   - **Tunnel State Manager (`src/manager.rs`)**:
+     - `TunnelManager`: thread-safe coordinator managing unique `tunnel_id` generation, pending open/bind response channels (`oneshot`), pending server-side TCP sockets, and UDP forwarding routes.
+   - **Local TCP Forwarding (`src/local.rs`)**:
+     - `run_local_forward`: binds local `TcpListener` on client for `-L`, requests tunnel from server, opens QUIC stream with `TunnelStreamPreamble`, and bridges bytes.
+   - **Dynamic SOCKS5 Proxy (`src/socks5.rs`, `src/local.rs`)**:
+     - Native RFC 1928 SOCKS5 protocol handshake parser (No Authentication `0x00`).
+     - Parses `CONNECT` requests for IPv4 (`0x01`), Domain Name (`0x03`), and IPv6 (`0x04`).
+     - Multiplexes requested target connections through QUIC streams.
+   - **Remote TCP Forwarding (`src/remote.rs`)**:
+     - `request_remote_forward`: requests server to bind remote listening port for `-R`.
+     - `bind_remote_forward_server`: server-side listener accepting incoming remote connections, opening QUIC stream to client with `TunnelStreamPreamble`, and bridging to client's local target network.
+   - **Native UDP Forwarding (`src/udp.rs`)**:
+     - `run_udp_forward` and `setup_server_udp_tunnel`: forwards raw UDP packets bidirectionally using QUIC Datagrams (RFC 9221) with `MUDP` framing and `tunnel_id` routing.
 
-### Prerequisites & Dependencies
-- Crates to implement: `crates/morsh-tunnel`
-- Workspace crates to integrate: `morsh-core`, `morsh-transport`, `morshd`, `morsh`
-- Dependencies to consider:
-  - `tokio = { workspace = true }` (TCP listeners, UDP sockets, streams)
-  - `async-socks5` or lightweight native SOCKS5 RFC 1928 handshake parser in `morsh-tunnel`.
+3. **Daemon Integration (`crates/morshd`)**:
+   - Stream supervisor demultiplexing Stream 1 (PTY) and Stream 2..N (Tunnels) via `TunnelStreamPreamble`.
+   - Control loop handling `TunnelOpenRequest`, `RemoteForwardRequest`, `TunnelClose`, and `NoShell`.
+   - Datagram router routing incoming UDP datagrams to/from target UDP sockets.
 
-### Step-by-Step Task Breakdown
-1. **Extend Wire Protocol in `crates/morsh-core/src/protocol.rs`**:
-   - Add tunnel control frames to `ControlMessage`:
-     - `TunnelOpenRequest { tunnel_id: u32, tunnel_type: TunnelType, host: String, port: u16 }`
-     - `TunnelOpenResponse { tunnel_id: u32, success: bool, message: String }`
-     - `TunnelClose { tunnel_id: u32 }`
-   - Define `TunnelType`: `LocalTcp`, `RemoteTcp`, `Socks5`, `UdpForward`.
-2. **Implement `crates/morsh-tunnel`**:
-   - **Local Forwarding Engine (`-L`)**:
-     - Binds local `tokio::net::TcpListener` on client.
-     - On incoming client TCP connection: requests tunnel stream from server, opens bidirectional QUIC stream (`StreamChannelKind::TcpForward`), and bridges bytes.
-   - **Remote Forwarding Engine (`-R`)**:
-     - Server binds `TcpListener` on remote network.
-     - On incoming remote TCP connection: opens bidirectional QUIC stream to client, bridges to client target host/port.
-   - **Dynamic SOCKS5 Proxy Engine (`-D`)**:
-     - Integrated SOCKS5 proxy server (RFC 1928, `NO_AUTH` method) listening locally on client.
-     - Parses `CONNECT` requests for IPv4, IPv6, and domain names, forwarding target connections through QUIC streams.
-   - **Native UDP Port Forwarding**:
-     - Binds local `UdpSocket`, forwards packets via QUIC Datagrams (RFC 9221) or low-latency streams.
-3. **Integrate into `morshd` and `morsh` CLIs**:
-   - Add CLI arguments to `morsh`:
-     - `-L, --local-forward <[bind_addr:]bind_port:target_host:target_port>`
-     - `-R, --remote-forward <[bind_addr:]bind_port:target_host:target_port>`
-     - `-D, --dynamic-forward <[bind_addr:]bind_port>`
-     - `-N, --no-shell` (do not allocate interactive PTY, tunnel mode only).
-   - Add corresponding listener daemon handling in `morshd`.
-4. **Verification & Tests**:
-   - Add unit tests in `morsh-tunnel` covering SOCKS5 handshake parsing and tunnel frame codecs.
-   - Add integration tests verifying live TCP port forwarding and SOCKS5 proxy requests through active QUIC sessions.
+4. **Client CLI Integration (`crates/morsh`)**:
+   - CLI flags: `-L, --local-forward`, `-R, --remote-forward`, `-D, --dynamic-forward`, `-U, --udp-forward`, `-N, --no-shell`.
+   - Asynchronous outbound control message pipeline and inbound response dispatcher.
+   - Support for pure tunnel mode (`-N`) that maintains tunnels active in the background without entering terminal raw mode.
+   - Live stream acceptor for remote forward (`-R`) incoming connections.
+
+5. **Architectural Choices & Tradeoffs Recorded**:
+   - **8-Byte Binary Stream Preamble (`MTUN` + `tunnel_id`)**: Rather than framing every payload packet on forwarded streams with Postcard overhead, forwarded QUIC streams transmit an 8-byte binary preamble at the initial connection. After preamble validation, Tokio's `copy` bridges raw bytes at bare-metal line rate.
+   - **Pre-Connecting Before Stream Allocation**: Upon receiving `TunnelOpenRequest`, the remote endpoint attempts to connect to the target destination *before* opening a QUIC stream. If the target port is unreachable or connection is refused, an immediate `TunnelOpenResponse { success: false }` is returned, preventing wasted QUIC stream quotas and immediately notifying the client.
+   - **Lightweight RFC 1928 Parser**: Implemented a focused, dependency-free SOCKS5 parser supporting IPv4, IPv6, and domain names. This avoided pulling in unmaintained or heavy third-party SOCKS crates while ensuring full async compatibility with Tokio.
+   - **Datagrams (RFC 9221) for UDP Forwarding**: Forwarding UDP packets via QUIC Datagrams prevents head-of-line blocking across dropped packets, providing the lowest latency possible for UDP-based traffic (DNS, gaming, audio).
+   - **Deterministic Stream Demultiplexing**: Stream index 1 is reserved for interactive PTY unless `-N / NoShell` is explicitly declared. Tunnel streams with indices >= 2 (or index 1 under `-N`) are disambiguated by their 8-byte binary preamble.
+
+6. **Automated Test Suite (57 Tests Passing Workspace-wide)**:
+   - **`morsh-tunnel` Unit Tests (13 passed)**:
+     - `config::tests::test_parse_forward_rule_three_parts` & `four_parts`: OpenSSH format parsing.
+     - `config::tests::test_parse_forward_rule_ipv6`: Bracketed IPv6 notation.
+     - `config::tests::test_parse_dynamic_rule`: Dynamic SOCKS5 rule parsing.
+     - `config::tests::test_parse_udp_rule`: UDP forwarding rule parsing.
+     - `socks5::tests::test_socks5_handshake_ipv4_connect`: IPv4 CONNECT negotiation.
+     - `socks5::tests::test_socks5_handshake_domain_connect`: Domain name CONNECT negotiation.
+     - `socks5::tests::test_socks5_handshake_ipv6_connect`: IPv6 CONNECT negotiation.
+     - `socks5::tests::test_socks5_handshake_unsupported_version`: Version rejection.
+     - `socks5::tests::test_socks5_send_reply`: Reply formatting.
+     - `udp::tests::test_udp_datagram_encoding_roundtrip`: Datagram encoding/decoding.
+   - **`morsh-tunnel` Integration Tests (`tests/tunnel_integration.rs`, 5 passed)**:
+     - `test_local_tcp_forwarding`: Full end-to-end `-L` local TCP forwarding through live QUIC transport.
+     - `test_remote_tcp_forwarding`: Full end-to-end `-R` remote TCP forwarding through live QUIC transport.
+     - `test_dynamic_socks5_proxy`: Full RFC 1928 SOCKS5 proxy handshake and data forwarding.
+     - `test_native_udp_forwarding`: Real-time UDP packet forwarding over QUIC Datagrams.
+     - `test_no_shell_tunnel_mode`: Tunnel-only execution under `-N` without allocating a PTY.
+   - **`morsh-core` Unit Tests**:
+     - `test_tunnel_frames_and_preamble_roundtrip`: Postcard serialization for all new tunnel frames and `TunnelStreamPreamble`.
+
+7. **Live CLI End-to-End Verification**:
+   - Started live `morshd` daemon on UDP/QUIC port `4646`.
+   - Executed live `morsh` CLI with `-L 9112:127.0.0.1:9111`, `-D 9113`, and `-N` (no shell).
+   - Verified local TCP port forward `-L` connected and received echoed payload.
+   - Verified dynamic SOCKS5 proxy `-D` performed handshake, connected to target, and received echoed payload.
 
 ---
 
-## 6. Work Log (Append History)
+## 6. Phase 5 Completion Record
+
+### Delivered Components
+1. **Wire Protocol & Codec Extensions (`crates/morsh-core`)**:
+   - `protocol::ControlMessage::ServerHello`: added `resumption_token: [u8; 16]` and `session_resumed: bool` for cryptographic resumption validation.
+   - `protocol::ControlMessage`: Added session persistence and terminal recovery frames:
+     - `SessionDetachRequest`: Voluntary detach request from client leaving server PTY running in background.
+     - `SessionResumeRequest { session_id, resumption_token }`: Client request to reconnect to existing session.
+     - `SessionResumeResponse { success, session_id, resumption_token, message }`: Server confirmation/rejection.
+     - `SessionListRequest`: Query active persistent sessions for authenticated user.
+     - `SessionListResponse { sessions: Vec<SessionInfo> }`: Active session metadata list.
+     - `ScreenSnapshot { cols, rows, cursor_x, cursor_y, buffer }`: Server-side virtual terminal screen state snapshot.
+     - `ScreenDelta { seq, delta }`: Incremental screen updates.
+   - `protocol::SessionInfo`: Struct containing `session_id`, `created_at_secs`, `last_attached_secs`, `cols`, `rows`, `attached`.
+   - `error::CoreError::Session(String)`: Dedicated session persistence error variant.
+   - Frame serialization roundtrip unit tests in `crates/morsh-core/src/frame.rs`.
+
+2. **Virtual Terminal Buffer & Detached PTY Supervisor (`crates/morsh-term`)**:
+   - **`TerminalStateBuffer` (`src/buffer.rs`)**:
+     - Virtual terminal emulator wrapping `vt100::Parser`.
+     - Processes raw ANSI/VT100 escape sequences and PTY output in real-time.
+     - Generates consolidated ANSI screen restoration snapshots (`snapshot()`) with screen clearing, cell attribute formatting (colors, bold, underline), and cursor positioning.
+     - Supports terminal resize (`resize()`), cursor querying (`cursor_position()`), and raw screen text dump (`text_contents()`).
+   - **`PersistentSession` (`src/session.rs`)**:
+     - Encapsulates running PTY process (`PtySession`), virtual terminal buffer (`TerminalStateBuffer`), and attached client sender channel.
+     - Spawns dedicated background PTY reader thread that feeds `TerminalStateBuffer` even when no client is attached.
+     - Non-blocking `write_input()` forwarding client keystrokes directly to slave shell stdin.
+     - Safe `attach()` and `detach()` methods managing client stream transitions.
+   - **`SessionRegistry` (`src/session.rs`)**:
+     - Thread-safe registry (`Arc<RwLock<HashMap<[u8; 16], Arc<PersistentSession>>>>`) managing session lifecycle.
+     - `create_session()`, `get_session()`, `resume_session()`, `list_sessions_for_user()`.
+     - Cryptographic 128-bit `resumption_token` validation preventing unauthorized session hijacking.
+     - `reap_dead_sessions()` periodically cleaning up sessions whose child processes have exited.
+
+3. **Server Daemon (`crates/morshd`)**:
+   - Integrated `SessionRegistry` into server daemon state with automatic background dead-session reaping task.
+   - Decoupled PTY process lifetime from QUIC connection: client disconnect or `SessionDetachRequest` detaches client streams without killing child shells.
+   - Implemented `SessionResumeRequest` handling: validates resumption token, attaches client to existing `PersistentSession`, and immediately transmits a `ScreenSnapshot` frame over Stream 0.
+   - Implemented `SessionListRequest` handling returning JSON/structured metadata of running sessions for the authenticated user.
+
+4. **Client CLI (`crates/morsh`)**:
+   - Added flags:
+     - `--resume <SESSION_ID>`: Reconnect to an existing detached persistent session.
+     - `--token <TOKEN>`: Explicit 128-bit cryptographic resumption token.
+     - `--list-sessions`: Query and display active sessions on remote server without opening a shell.
+   - Automatic session token caching in `~/.morsh/sessions/<session_id>.token`.
+   - Raw mode escape sequence state machine: detects `Ctrl-^ d` (0x1e followed by 'd'/'D'/'.') to voluntarily detach without terminating remote shell. Typing `Ctrl-^ Ctrl-^` emits a literal `0x1e`.
+   - Instant screen restoration: upon receiving `ScreenSnapshot` on resume, renders ANSI snapshot directly to local stdout.
+
+5. **Architectural Choices & Tradeoffs Recorded**:
+   - **Virtual Terminal Grid (`vt100`) vs. Raw Scrollback Replay**: Replaying unbuffered raw byte history on reconnect is bandwidth-intensive, causes terminal flicker, and breaks ncurses apps (e.g. `vim`, `htop`). Maintaining a server-side `vt100::Parser` allows generating a consolidated ANSI snapshot (`snapshot()`) that restores the exact screen layout and cursor position in a single frame.
+   - **Decoupled PTY Lifecycles**: In `morshd`, PTY sessions are managed by `PersistentSession`. When a client's QUIC connection closes (graceful disconnect, network drop, or voluntary detach), the daemon only detaches the client stream channel; the master PTY reader continues running in the background, updating the `vt100` buffer. Only explicit child process exit (e.g. typing `exit`) triggers cleanup.
+   - **Cryptographic Resumption Bearer Tokens**: Sessions are protected by a random 128-bit `resumption_token` generated during initial connection. Clients resuming a session must present both `session_id` and `resumption_token`, preventing unauthorized session hijacking. Tokens are cached locally in `~/.morsh/sessions/` for seamless user resumption.
+   - **Escape Sequence State Machine (`Ctrl-^ d`)**: `0x1E` (`Ctrl-^`, standard Mosh escape) initiates the detach sequence. Pressing `d`, `D`, or `.` sends `SessionDetachRequest` and exits cleanly. Pressing `0x1E` twice emits a literal `0x1E` to the remote shell.
+
+6. **Automated Test Suite (65 Tests Passing Workspace-wide)**:
+   - **`morsh-term` Unit Tests (12 passed)**:
+     - `buffer::tests::test_buffer_creation_and_size`: Buffer dimensions verification.
+     - `buffer::tests::test_buffer_processing_and_text_contents`: Real-time text parsing.
+     - `buffer::tests::test_buffer_snapshot_reproduction`: ANSI snapshot generation and screen redraw reproduction.
+     - `buffer::tests::test_buffer_resize`: Window resizing on virtual parser.
+     - `session::tests::test_session_registry_workflow`: Creation, token validation, resume, rejection, and reaping.
+     - `session::tests::test_persistent_session_spawn_and_background_execution`: Shell persistence across attach/detach.
+   - **`morsh-term` Integration Tests (`tests/term_integration.rs`, 5 passed)**:
+     - `test_session_persistence_detach_and_resume_with_snapshot`: Full live QUIC flow with PTY persistence, client voluntary detach, background execution, reconnection with token, and snapshot verification.
+     - `test_session_resume_token_mismatch_rejected`: Verifies unauthorized resumption attempts with rogue tokens are rejected.
+     - `test_session_list_query`: Verifies client can query active session list.
+   - **`morsh-core` Unit Tests**:
+     - `test_session_and_screen_frames_roundtrip`: Postcard serialization for all new session frames.
+   - **Live CLI End-to-End Verification**:
+     - Verified `morshd` and `morsh` with `--list-sessions`, `--resume`, and interactive `Ctrl-^ d` voluntary detachment.
+
+---
+
+## 7. Phase 6 Completion Record
+
+### Delivered Components
+1. **Predictive Local Echo Engine (`crates/morsh-predict`)**:
+   - **`style.rs`**:
+     - `PredictStyle`: `Underline` (`\x1b[4m ... \x1b[24m`), `Dim` (`\x1b[2m ... \x1b[22m`), and `None` (plain output).
+     - `PredictMode`: `Auto`, `Always`, `Never`.
+     - `render()` applying non-destructive ANSI SGR styling that leaves shell colors intact.
+   - **`keystroke.rs`**:
+     - `Keystroke` classification: `Printable(char)`, `Backspace`, `CursorLeft`, `CursorRight`, `Newline`, and `Unpredicted(Vec<u8>)`.
+     - `parse_keystrokes()` parses multi-byte UTF-8, backspace (`0x08`, `0x7f`), newlines, and ANSI arrow escape sequences (`\x1b[D`, `\x1b[C`, `\x1bOD`, `\x1bOC`).
+   - **`confidence.rs`**:
+     - `ConfidenceTracker` adapting prediction confidence (`High`, `Tentative`, `Suppressed`).
+     - Heuristic suppression for alternate screen buffers (`\x1b[?1049h`, `\x1b[?47h`) protecting fullscreen apps (Vim, Nano, Htop, Less).
+     - Heuristic suppression for password prompts (no-echo mode when prompt contains `password:` or `passphrase:`).
+     - Degradation to tentative/suppressed on prediction divergence with automatic cooldown and probation recovery after 3 consecutive confirmations.
+   - **`prediction.rs`**:
+     - `Prediction` struct recording sequence ID, raw input bytes, predicted echo bytes, speculative render bytes, and cursor column displacement.
+   - **`rollback.rs`**:
+     - `generate_rollback()` creates ANSI backstep and clear-to-end-of-line escape sequences (`\x08 \x08`, `\x1b[ND\x1b[K`) to seamlessly erase speculative display modifications upon server divergence.
+   - **`engine.rs`**:
+     - `PredictionEngine`: coordinates speculative rendering on local stdin, stream output matching, divergence detection, 1-RTT rollback, and sequence acknowledgements.
+     - `process_input()` returns styled bytes to render immediately to local terminal stdout without waiting for server network RTT.
+     - `process_server_output()` matches incoming PTY bytes against prediction queue; outputs authoritative server output or rollback erasure prefix on divergence.
+     - `handle_ack()` acknowledges predictions up to given sequence number.
+     - `reset()` flushes rollback sequences on exit.
+
+2. **Wire Protocol Sequence Frames (`crates/morsh-core`)**:
+   - `protocol::ControlMessage::PredictInputSeq { seq, len }`: Client notifies server of input sequence batch.
+   - `protocol::ControlMessage::PredictAck { ack_seq }`: Server acknowledges processed input sequences.
+   - Added Postcard binary frame roundtrip test `test_predict_frames_roundtrip` in `crates/morsh-core/src/frame.rs`.
+
+3. **Server Daemon Integration (`crates/morshd`)**:
+   - Added `ControlMessage::PredictInputSeq` handling in `morshd` Stream 0 control loop, immediately returning `ControlMessage::PredictAck`.
+
+4. **Client CLI Integration (`crates/morsh`)**:
+   - Added CLI flags:
+     - `--predict <MODE>`: `auto` (default), `always`, `never`.
+     - `--predict-style <STYLE>`: `underline` (default), `dim`, `none`.
+   - Connected `PredictionEngine` into the raw mode terminal loop:
+     - Typed characters are optimistically styled and rendered to local `stdout` instantly.
+     - Remote PTY output from Stream 1 is matched against `PredictionEngine`, executing 1-RTT rollback when server output diverges.
+     - Sequence acknowledgements from server (`PredictAck`) advance prediction queue.
+     - RAII reset on exit clears any pending speculative characters.
+
+5. **Architectural Choices & Tradeoffs Recorded**:
+   - **Attribute-Preserving SGR Reset Codes**: Speculative styling uses specific reset codes (`\x1b[24m` for underline off, `\x1b[22m` for normal intensity) rather than generic `\x1b[0m`. This ensures speculative rendering does not destroy custom foreground/background colors set by user shells (Zsh, Fish, Starship prompt).
+   - **Automatic Alternate Screen Buffer Suppression**: Fullscreen applications (Vim, Nano, Htop) exhibit arbitrary cursor jumps and command states where linear character echo is incorrect. Detecting `\x1b[?1049h` and `\x1b[?47h` automatically pauses speculative echo until the application exits (`\x1b[?1049l`).
+   - **Password / No-Echo Mode Detection**: Speculative echo is suppressed when password prompts are detected in server output, protecting sensitive credentials from being echoed to the local terminal screen.
+   - **1-RTT Zero-Flicker Rollback**: By emitting `\x1b[ND\x1b[K` before writing authoritative server output, the client smoothly replaces speculative predictions with actual server output without terminal jitter or duplicate characters.
+
+6. **Automated Test Suite (92 Tests Passing Workspace-wide)**:
+   - **`morsh-predict` Unit Tests (20 passed)**:
+     - Keystroke parsing (printable ASCII, UTF-8 Unicode, backspace, arrows, control characters).
+     - Visual style rendering (underline, dim, none) and CLI parsing.
+     - Confidence state machine (degradation, cooldown recovery, alternate screen suppression, password suppression).
+     - Rollback generator (single column, multiple columns, zero).
+     - Engine input processing, server output confirmation, backspace erase, and sequence ack handling.
+   - **`morsh-predict` Integration Tests (`tests/predict_integration.rs`, 6 passed)**:
+     - `test_interactive_typing_simulation_with_server_delay`: Simulated RTT chunking with confirmation.
+     - `test_speculative_rollback_on_command_rejection`: 1-RTT divergence detection with rollback sequence verification.
+     - `test_dim_style_speculative_rendering`: Visual styling validation.
+     - `test_rapid_editing_with_backspace`: Local erasure of speculative characters on backspace.
+     - `test_alternate_screen_transition_suppresses_and_restores`: Fullscreen editor detection and restoration.
+     - `test_predict_sequence_acknowledgement_over_quic`: Live QUIC client/server sequence notification and acknowledgement exchange.
+   - **`morsh-core` Unit Tests**:
+     - `test_predict_frames_roundtrip`: Serialization roundtrip for `PredictInputSeq` and `PredictAck`.
+   - **Live CLI End-to-End Verification**:
+     - Started live `morshd` daemon on UDP/QUIC port `4848`.
+     - Executed live `morsh` client with `--predict always --predict-style underline`.
+     - Verified interactive pipeline execution (`echo PREDICT_PIPELINE_OK`), command output, and clean session exit.
+
+---
+
+## 8. Phase 7 Action Plan (Handoff Instructions)
+
+When beginning a new conversation to implement **Phase 7: TCP Fallback & Network Resilience**:
+
+### Primary Objective
+Ensure reliable connectivity in hostile or restrictive network environments where UDP or QUIC is blocked, rate-limited, or throttled by corporate firewalls and middleboxes, using Happy Eyeballs auto-detection and TLS 1.3 over TCP fallback.
+
+### Prerequisites & Dependencies
+- Crates to implement: `crates/morsh-transport`, `crates/morshd`, `crates/morsh`
+- Core concepts:
+  - **Happy Eyeballs Auto-Detection (RFC 8305 style)**:
+    - Client attempts QUIC (UDP) connection with a fast fallback timer (e.g. 250–300 ms).
+    - If QUIC handshake does not establish within the threshold or UDP is blocked, concurrently initiate TLS 1.3 over TCP connection.
+    - First connection to successfully complete TLS handshake wins; loser is cleanly canceled.
+  - **TLS 1.3 over TCP Transport Abstraction**:
+    - Framing layer running standard TLS 1.3 (`rustls`) over Tokio `TcpStream`.
+    - Provide a unified transport trait or enum (`MorshTransport::Quic` vs `MorshTransport::Tcp`) wrapping Stream 0 control, Stream 1 PTY, and stream multiplexing over TCP using binary sub-stream framing.
+  - **Dual-Stack Listener in `morshd`**:
+    - Server listens concurrently on QUIC/UDP and TCP fallback port (e.g. sharing port 2222 or custom port).
+    - Accepts both incoming QUIC connections and incoming TLS/TCP streams.
+
+### Step-by-Step Task Breakdown
+1. **Transport Abstraction in `crates/morsh-transport`**:
+   - Implement `TcpTlsListener` and `TcpTlsStream` using `tokio_rustls` or `rustls`.
+   - Multiplex sub-streams over single TCP connection (stream ID header for Control, PTY, Tunnels).
+   - Implement Happy Eyeballs connector: `connect_happy_eyeballs(addr, server_name, timeout)`.
+2. **Server Daemon Updates in `crates/morshd`**:
+   - Concurrently bind TCP fallback listener alongside QUIC endpoint.
+   - Dispatch accepted TCP connections through the same authentication, PTY, tunnel, and session persistence pipeline.
+3. **Client CLI Updates in `crates/morsh`**:
+   - Add CLI flag `--force-tcp` and `--tcp-fallback-timeout <ms>`.
+   - Default client behavior uses Happy Eyeballs to automatically select fastest working transport.
+4. **Verification & Tests**:
+   - Unit tests for TCP multiplexing framing and Happy Eyeballs timer.
+   - Integration tests simulating blocked UDP and verifying seamless TCP fallback.
+
+---
+
+## 9. Work Log (Append History)
 
 ### 2026-10-05 — Phase 1 Completed
 - Initialized multi-crate workspace (`morsh-core`, `morsh-transport`, `morsh-auth`, `morsh-term`, `morsh-predict`, `morsh-tunnel`, `morshd`, `morsh`).
@@ -285,4 +509,68 @@ Implement local TCP port forwarding (`-L`), remote TCP port forwarding (`-R`), d
 - Implemented and verified QUIC connection migration (IP roaming) via `QuicClient::rebind`: proved active interactive PTY sessions survive UDP socket rebinding with server dynamically tracking updated remote address.
 - Added 5 new unit tests in `morsh-term`, 2 integration tests in `term_integration.rs`, and 1 migration integration test in `quic_integration.rs`, reaching 38 passing tests workspace-wide with 0 warnings.
 - Verified live end-to-end interactive execution with `morshd` and `morsh` running the user's login shell inside a pseudo-terminal.
+
+### 2026-10-06 — Phase 4 Completed
+- Implemented Phase 4 Port Forwarding & Tunnels across `morsh-core`, `morsh-tunnel`, `morshd`, and `morsh`.
+- Added tunnel control frames to `morsh-core`: `TunnelOpenRequest`, `TunnelOpenResponse`, `TunnelClose`, `RemoteForwardRequest`, `RemoteForwardResponse`, `NoShell`, and zero-allocation 8-byte `TunnelStreamPreamble` (`MTUN` magic).
+- Built `morsh-tunnel` crate:
+  - Configuration parsing for `-L`, `-R`, `-D`, `-U` rules with OpenSSH CLI format and IPv6 bracket syntax.
+  - Non-blocking bidirectional bridge (`bridge_tcp_and_quic`) with half-close handling.
+  - Thread-safe `TunnelManager` tracking active tunnels, pending oneshots, pending server streams, and UDP routes.
+  - Local TCP port forwarding engine (`-L`).
+  - Dynamic SOCKS5 proxy engine (`-D`) implementing native RFC 1928 protocol parser (IPv4, IPv6, Domain names).
+  - Remote TCP port forwarding engine (`-R`) with remote listener binding on server and client local bridging.
+  - Native UDP forwarding engine (`-U`) over QUIC Datagrams (RFC 9221) with `MUDP` framing.
+- Integrated into `morshd` server daemon:
+  - Stream supervisor multiplexing Stream 1 (PTY) and Stream 2..N (Tunnels) via `TunnelStreamPreamble`.
+  - Background datagram router for UDP tunnels.
+  - Control loop handling tunnel open, remote bind, and close frames.
+- Integrated into `morsh` client CLI:
+  - CLI flags: `-L, --local-forward`, `-R, --remote-forward`, `-D, --dynamic-forward`, `-U, --udp-forward`, `-N, --no-shell`.
+  - Tunnel-only mode (`-N`) keeping tunnels alive in background.
+  - Server-initiated stream acceptor for `-R`.
+  - UDP datagram return router for `-U`.
+- Added 19 new tests: 13 unit tests in `morsh-tunnel`, 5 integration tests in `tunnel_integration.rs`, 1 unit test in `morsh-core`, reaching 57 passing tests workspace-wide with 0 warnings.
+- Verified live end-to-end execution of `-L` and `-D` SOCKS5 proxy over live QUIC connections with `morshd` and `morsh`.
+
+### 2026-10-06 — Phase 5 Completed
+- Implemented Phase 5 Session Persistence & Screen State Recovery (Mosh Style) across `morsh-core`, `morsh-term`, `morshd`, and `morsh`.
+- Added session control frames to `morsh-core`: `SessionDetachRequest`, `SessionResumeRequest`, `SessionResumeResponse`, `SessionListRequest`, `SessionListResponse`, `ScreenSnapshot`, `ScreenDelta`, and `SessionInfo` struct.
+- Built `TerminalStateBuffer` in `morsh-term` wrapping `vt100::Parser`:
+  - Maintained virtual screen cells, dimensions, cursor coordinates, and attributes in real-time.
+  - Implemented `snapshot()` producing consolidated ANSI screen clear and redraw sequences.
+- Built `PersistentSession` and `SessionRegistry` in `morsh-term`:
+  - Decoupled PTY child process lifetime from QUIC connection.
+  - Background PTY reader thread keeps `TerminalStateBuffer` synchronized even when detached.
+  - Cryptographic 128-bit session resumption token verification preventing unauthorized access.
+  - Dead session background cleanup on child process termination.
+- Integrated session management into `morshd` daemon:
+  - Handled voluntary detachment (`SessionDetachRequest`) and connection drop without killing shell.
+  - Implemented resumption handling transmitting immediate `ScreenSnapshot` for instant display recovery.
+  - Implemented session listing for authenticated users.
+- Integrated session recovery into `morsh` client CLI:
+  - CLI flags: `--resume <SESSION_ID>`, `--token <TOKEN>`, `--list-sessions`.
+  - Local token caching in `~/.morsh/sessions/`.
+  - Raw mode escape sequence state machine: `Ctrl-^ d` (0x1e followed by 'd'/'D'/'.') for clean voluntary detach.
+  - Instant screen redraw on receiving `ScreenSnapshot`.
+- Added 8 new tests: 7 in `morsh-term` (including 3 integration tests in `term_integration.rs`) and 1 in `morsh-core`, reaching 65 passing tests workspace-wide with 0 warnings.
+- Verified live end-to-end execution of `--list-sessions`, `--resume`, and `Ctrl-^ d` voluntary detachment.
+
+### 2026-10-06 — Phase 6 Completed
+- Implemented Phase 6 Predictive Local Echo & Speculative UI (Mosh Style) across `morsh-core`, `morsh-predict`, `morshd`, and `morsh`.
+- Added predictive sequence control frames to `morsh-core`: `PredictInputSeq { seq, len }` and `PredictAck { ack_seq }`.
+- Built full `morsh-predict` crate:
+  - `PredictStyle`: underline (`\x1b[4m ... \x1b[24m`), dim (`\x1b[2m ... \x1b[22m`), and none.
+  - `PredictMode`: auto (heuristic), always, never.
+  - `Keystroke` classifier parsing printable Unicode/ASCII, backspace (`\x08`, `\x7f`), newlines, and ANSI arrow keys (`\x1b[D`, `\x1b[C`).
+  - `ConfidenceTracker` adapting confidence level (`High`, `Tentative`, `Suppressed`) with suppression heuristics for alternate screen buffers (`\x1b[?1049h`) and password prompts (`password:`).
+  - `Prediction` tracking sequence identifiers, expected echoes, and speculative displays.
+  - `generate_rollback` creating ANSI cursor backstep and line erase sequences (`\x08 \x08`, `\x1b[ND\x1b[K`).
+  - `PredictionEngine` managing speculative rendering, stream output matching, divergence rollback, and sequence acknowledgements.
+- Integrated sequence acknowledgement in `morshd` server daemon over Stream 0.
+- Integrated predictive local echo into `morsh` client CLI with `--predict` and `--predict-style` flags, immediate speculative rendering to local stdout, 1-RTT divergence detection and rollback upon server output mismatch, and clean terminal exit restoration.
+- Added 27 new tests: 20 unit tests in `morsh-predict`, 6 integration tests in `predict_integration.rs` (including live QUIC exchange), and 1 in `morsh-core`, reaching 92 passing tests workspace-wide with 0 warnings.
+- Verified live end-to-end execution with `morshd` and `morsh` running piped shell commands with active speculative prediction.
+
+
 

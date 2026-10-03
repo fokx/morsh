@@ -28,6 +28,12 @@ pub enum CoreError {
 
     #[error("Authentication failed: {0}")]
     AuthFailed(String),
+
+    #[error("Tunnel error: {0}")]
+    Tunnel(String),
+
+    #[error("Session error: {0}")]
+    Session(String),
 }
 
 

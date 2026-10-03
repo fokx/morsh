@@ -50,4 +50,5 @@ anyhow = "1.0"
 # Terminal & PTY
 portable-pty = "0.9"
 crossterm = { version = "0.28", features = ["event-stream"] }
+vt100 = "0.15"
 futures-util = "0.3"

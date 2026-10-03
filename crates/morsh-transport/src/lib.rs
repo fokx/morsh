@@ -47,6 +47,7 @@ mod tests {
                 version: 1,
                 server_software: "morshd-test".into(),
                 session_id: [7u8; 16],
+                resumption_token: [0u8; 16],
                 supported_auth: vec![],
                 session_resumed: false,
             };

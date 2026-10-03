@@ -99,6 +99,7 @@ mod tests {
             version: 1,
             server_software: "morshd-test".into(),
             session_id: [42u8; 16],
+            resumption_token: [99u8; 16],
             supported_auth: vec![AuthMethod::None, AuthMethod::Password],
             session_resumed: false,
         };
@@ -242,5 +243,133 @@ mod tests {
         let mut reader = Cursor::new(corrupt_data);
         let result: Result<ControlMessage> = read_frame(&mut reader).await;
         assert!(matches!(result, Err(CoreError::Deserialization(_))));
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_frames_and_preamble_roundtrip() {
+        use crate::protocol::{TunnelStreamPreamble, TunnelType, TUNNEL_STREAM_MAGIC};
+
+        let open_req = ControlMessage::TunnelOpenRequest {
+            tunnel_id: 42,
+            tunnel_type: TunnelType::LocalTcp,
+            host: "127.0.0.1".into(),
+            port: 8080,
+        };
+        let open_resp = ControlMessage::TunnelOpenResponse {
+            tunnel_id: 42,
+            success: true,
+            message: "Connected".into(),
+        };
+        let close_msg = ControlMessage::TunnelClose { tunnel_id: 42 };
+        let remote_req = ControlMessage::RemoteForwardRequest {
+            bind_addr: "0.0.0.0".into(),
+            bind_port: 9000,
+            target_host: "localhost".into(),
+            target_port: 3000,
+        };
+        let remote_resp = ControlMessage::RemoteForwardResponse {
+            bind_port: 9000,
+            success: true,
+            message: "Bound".into(),
+        };
+        let no_shell = ControlMessage::NoShell;
+
+        for msg in [open_req, open_resp, close_msg, remote_req, remote_resp, no_shell] {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &msg).await.unwrap();
+            let mut reader = Cursor::new(buffer);
+            let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
+            assert_eq!(msg, decoded);
+        }
+
+        // Test TunnelStreamPreamble
+        let preamble = TunnelStreamPreamble::new(1001);
+        let bytes = preamble.to_bytes();
+        assert_eq!(&bytes[0..4], &TUNNEL_STREAM_MAGIC);
+        let parsed = TunnelStreamPreamble::from_bytes(&bytes).unwrap();
+        assert_eq!(preamble, parsed);
+
+        // Invalid magic returns None
+        let mut invalid_bytes = bytes;
+        invalid_bytes[0] = b'X';
+        assert!(TunnelStreamPreamble::from_bytes(&invalid_bytes).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_and_screen_frames_roundtrip() {
+        use crate::protocol::SessionInfo;
+
+        let detach = ControlMessage::SessionDetachRequest;
+        let resume_req = ControlMessage::SessionResumeRequest {
+            session_id: [1u8; 16],
+            resumption_token: [2u8; 16],
+        };
+        let resume_resp = ControlMessage::SessionResumeResponse {
+            success: true,
+            session_id: [1u8; 16],
+            resumption_token: [2u8; 16],
+            message: "Resumed successfully".into(),
+        };
+        let list_req = ControlMessage::SessionListRequest;
+        let list_resp = ControlMessage::SessionListResponse {
+            sessions: vec![
+                SessionInfo {
+                    session_id: [1u8; 16],
+                    user: "alice".into(),
+                    created_at_secs: 1700000000,
+                    cols: 80,
+                    rows: 24,
+                    is_attached: false,
+                },
+            ],
+        };
+        let snapshot = ControlMessage::ScreenSnapshot {
+            cols: 120,
+            rows: 40,
+            cursor_x: 10,
+            cursor_y: 5,
+            buffer: b"\x1b[2J\x1b[HHello Screen State".to_vec(),
+        };
+        let delta = ControlMessage::ScreenDelta {
+            seq: 42,
+            delta: b"update chunk".to_vec(),
+        };
+
+        let messages = vec![
+            detach,
+            resume_req,
+            resume_resp,
+            list_req,
+            list_resp,
+            snapshot,
+            delta,
+        ];
+
+        for msg in messages {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &msg).await.unwrap();
+            let mut reader = Cursor::new(buffer);
+            let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_predict_frames_roundtrip() {
+        let input_seq = ControlMessage::PredictInputSeq {
+            seq: 101,
+            len: 5,
+        };
+        let ack = ControlMessage::PredictAck {
+            ack_seq: 101,
+        };
+
+        for msg in [input_seq, ack] {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &msg).await.unwrap();
+            let mut reader = Cursor::new(buffer);
+            let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
+            assert_eq!(msg, decoded);
+        }
     }
 }

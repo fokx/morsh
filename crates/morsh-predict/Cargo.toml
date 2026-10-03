@@ -7,4 +7,11 @@ authors.workspace = true
 
 [dependencies]
 morsh-core.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+morsh-transport.workspace = true
+tokio = { workspace = true, features = ["full"] }
+

@@ -14,6 +14,7 @@ morsh-core.workspace = true
 morsh-transport.workspace = true
 morsh-auth.workspace = true
 morsh-term.workspace = true
+morsh-tunnel.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio.workspace = true

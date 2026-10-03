@@ -15,6 +15,15 @@ pub enum TermError {
     #[error("PTY child process already terminated")]
     Terminated,
 
+    #[error("Session not found: {0}")]
+    SessionNotFound(String),
+
+    #[error("Session authentication token mismatch")]
+    SessionTokenMismatch,
+
+    #[error("Session is already attached to an active client")]
+    SessionAlreadyAttached,
+
     #[error("Underlying IO error: {0}")]
     Io(#[from] std::io::Error),
 

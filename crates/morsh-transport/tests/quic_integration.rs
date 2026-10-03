@@ -49,6 +49,7 @@ async fn test_full_handshake_flow_and_pings() {
             version: PROTOCOL_VERSION,
             server_software: "morshd-test".into(),
             session_id,
+            resumption_token: [0u8; 16],
             supported_auth: vec![AuthMethod::None],
             session_resumed: false,
         };
@@ -224,6 +225,7 @@ async fn test_stealth_knock_authorization_flow() {
                 version: PROTOCOL_VERSION,
                 server_software: "morshd".into(),
                 session_id: generate_session_id(),
+                resumption_token: [0u8; 16],
                 supported_auth: vec![],
                 session_resumed: false,
             };

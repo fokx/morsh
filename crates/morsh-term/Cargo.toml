@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 morsh-core.workspace = true
 portable-pty.workspace = true
+vt100.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

@@ -1,11 +1,17 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use morsh_auth::{generate_challenge, AuthorizedKeys, PamAuthenticator, PasswordVerifier};
-use morsh_core::protocol::{AuthMethod, AuthRequest, ControlMessage, PROTOCOL_VERSION};
-use morsh_term::{PtyConfig, PtyHandle, PtySession};
+use morsh_core::protocol::{
+    AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PROTOCOL_VERSION,
+};
+use morsh_term::{PersistentSession, PtyConfig, SessionRegistry};
 use morsh_transport::{
     cert_fingerprint_sha256, generate_self_signed_cert, generate_session_id, make_server_config,
     MorshConnection, QuicServer,
+};
+use morsh_tunnel::{
+    bind_remote_forward_server, bridge_tcp_and_quic, decode_udp_datagram,
+    setup_server_udp_tunnel, TunnelManager,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
@@ -96,6 +102,7 @@ fn load_certs_and_key(
 async fn handle_connection(
     conn: MorshConnection,
     opts: Arc<ServerAuthOptions>,
+    session_registry: SessionRegistry,
 ) -> Result<()> {
     let peer_addr = conn.remote_address();
     info!(peer = %peer_addr, "Handling new client connection");
@@ -163,6 +170,7 @@ async fn handle_connection(
     };
 
     let session_id = generate_session_id();
+    let resumption_token = generate_session_id();
     let session_hex = hex_encode(&session_id);
 
     info!(
@@ -194,6 +202,7 @@ async fn handle_connection(
         version: PROTOCOL_VERSION,
         server_software: format!("morshd-{}", env!("CARGO_PKG_VERSION")),
         session_id,
+        resumption_token,
         supported_auth: supported_auth.clone(),
         session_resumed: false,
     };
@@ -364,8 +373,8 @@ async fn handle_connection(
         "User session authorized; entering control loop"
     );
 
-    // Shared state for PTY session
-    let pty_handle: Arc<tokio::sync::Mutex<Option<PtyHandle>>> =
+    // Shared state for persistent PTY session
+    let active_session: Arc<tokio::sync::Mutex<Option<Arc<PersistentSession>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     let initial_dims: Arc<tokio::sync::Mutex<(u16, u16)>> =
         Arc::new(tokio::sync::Mutex::new((80, 24)));
@@ -373,18 +382,39 @@ async fn handle_connection(
         Arc::new(tokio::sync::Mutex::new("xterm-256color".into()));
 
     let (pty_shutdown_tx, mut pty_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let pty_handle_for_accept = Arc::clone(&pty_handle);
+    let pty_shutdown_tx_opt = Arc::new(tokio::sync::Mutex::new(Some(pty_shutdown_tx)));
+    let active_session_for_accept = Arc::clone(&active_session);
+    let session_registry_for_stream = session_registry.clone();
     let initial_dims_for_accept = Arc::clone(&initial_dims);
     let initial_term_for_accept = Arc::clone(&initial_term);
     let auth_user_clone = authenticated_user.clone();
-    let conn_clone = conn.clone();
 
-    // Spawn supervisor for Stream 1 (Interactive PTY raw byte stream)
-    let pty_task = tokio::spawn(async move {
-        tokio::select! {
-            accept_res = conn_clone.accept_bi() => {
-                match accept_res {
-                    Ok((mut pty_send, mut pty_recv)) => {
+    // Channel for asynchronous control frame transmissions back to client
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<ControlMessage>(64);
+    let tunnel_manager = TunnelManager::new(Some(ctrl_tx.clone()));
+
+    let no_shell_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let no_shell_stream = Arc::clone(&no_shell_flag);
+    let pty_spawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pty_spawned_stream = Arc::clone(&pty_spawned);
+
+    // Stream supervisor: multiplexes Stream 1 (PTY) and Stream 2..N (Tunnels)
+    let tunnel_manager_streams = tunnel_manager.clone();
+    let conn_stream_supervisor = conn.clone();
+    let stream_task = tokio::spawn(async move {
+        while let Ok((stream_send, mut stream_recv)) = conn_stream_supervisor.accept_bi().await {
+            let is_stream_1 = stream_send.id().index() == 1;
+            let no_shell = no_shell_stream.load(std::sync::atomic::Ordering::SeqCst);
+            let already_spawned = pty_spawned_stream.load(std::sync::atomic::Ordering::SeqCst);
+
+            if is_stream_1 && !no_shell && !already_spawned {
+                pty_spawned_stream.store(true, std::sync::atomic::Ordering::SeqCst);
+                let (mut pty_send, mut pty_recv) = (stream_send, stream_recv);
+
+                let session_opt = active_session_for_accept.lock().await.clone();
+                let session = match session_opt {
+                    Some(s) => s,
+                    None => {
                         let (cols, rows) = *initial_dims_for_accept.lock().await;
                         let term = initial_term_for_accept.lock().await.clone();
                         let mut cfg = PtyConfig {
@@ -397,72 +427,109 @@ async fn handle_connection(
                             cfg.user = Some(auth_user_clone.clone());
                         }
 
-                        match PtySession::spawn(&cfg) {
-                            Ok(session) => {
-                                info!(user = %auth_user_clone, cols, rows, "Interactive PTY allocated successfully");
-                                let (handle, mut pty_reader, mut pty_writer) = session.split();
-                                *pty_handle_for_accept.lock().await = Some(handle.clone());
-
-                                // Pipe PTY stdout -> Stream 1 writer
-                                let pty_out = tokio::spawn(async move {
-                                    use tokio::io::AsyncReadExt;
-                                    let mut buf = [0u8; 4096];
-                                    loop {
-                                        match pty_reader.read(&mut buf).await {
-                                            Ok(0) => break,
-                                            Ok(n) => {
-                                                if pty_send.write_all(&buf[..n]).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                    let _ = pty_send.finish();
-                                    debug!("PTY stdout closed");
-                                });
-
-                                // Pipe Stream 1 reader -> PTY stdin
-                                let pty_in = tokio::spawn(async move {
-                                    use tokio::io::AsyncWriteExt;
-                                    let mut buf = [0u8; 4096];
-                                    loop {
-                                        match pty_recv.read(&mut buf).await {
-                                            Ok(Some(n)) if n > 0 => {
-                                                if pty_writer.write_all(&buf[..n]).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            _ => break,
-                                        }
-                                    }
-                                    debug!("PTY stdin closed");
-                                });
-
-                                tokio::select! {
-                                    _ = pty_out => {
-                                        debug!("PTY process exited; output closed");
-                                    }
-                                    _ = &mut pty_shutdown_rx => {
-                                        debug!("PTY session received shutdown signal");
-                                    }
-                                }
-
-                                pty_in.abort();
-                                let _ = handle.kill();
+                        match session_registry_for_stream
+                            .create_session(
+                                session_id,
+                                resumption_token,
+                                auth_user_clone.clone(),
+                                &cfg,
+                            )
+                            .await
+                        {
+                            Ok(new_sess) => {
+                                info!(
+                                    user = %auth_user_clone,
+                                    cols, rows,
+                                    session_id = %hex_encode(&session_id),
+                                    "Persistent PTY session created and registered"
+                                );
+                                *active_session_for_accept.lock().await =
+                                    Some(Arc::clone(&new_sess));
+                                new_sess
                             }
                             Err(e) => {
-                                warn!(error = %e, "Failed to spawn PTY session");
+                                warn!(error = %e, "Failed to spawn persistent PTY session");
+                                continue;
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!(error = %e, "No interactive PTY stream initiated by peer");
+                };
+
+                let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                session.attach(client_tx).await;
+
+                let pty_out = tokio::spawn(async move {
+                    while let Some(chunk) = client_rx.recv().await {
+                        if pty_send.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = pty_send.finish();
+                    debug!("PTY output channel closed");
+                });
+
+                let session_in = Arc::clone(&session);
+                let pty_in = tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match pty_recv.read(&mut buf).await {
+                            Ok(Some(n)) if n > 0 => {
+                                if session_in.write_input(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    debug!("PTY stdin stream closed");
+                });
+
+                tokio::select! {
+                    _ = pty_out => {
+                        debug!("PTY output loop finished");
+                    }
+                    _ = &mut pty_shutdown_rx => {
+                        debug!("PTY session received shutdown signal");
                     }
                 }
+
+                pty_in.abort();
+                session.detach().await;
+            } else {
+                // Forwarded Tunnel stream
+                let mgr = tunnel_manager_streams.clone();
+                tokio::spawn(async move {
+                    let mut preamble_bytes = [0u8; 8];
+                    if let Err(e) = stream_recv.read_exact(&mut preamble_bytes).await {
+                        warn!(error = %e, "Failed to read tunnel preamble from stream");
+                        return;
+                    }
+                    if let Some(preamble) = TunnelStreamPreamble::from_bytes(&preamble_bytes) {
+                        debug!(tunnel_id = preamble.tunnel_id, "Handling incoming tunnel stream");
+                        if let Some(tcp_stream) = mgr.take_server_stream(preamble.tunnel_id).await {
+                            bridge_tcp_and_quic(tcp_stream, stream_send, stream_recv).await;
+                        } else {
+                            warn!(tunnel_id = preamble.tunnel_id, "No pending TCP socket found for tunnel");
+                        }
+                    } else {
+                        warn!("Incoming stream failed tunnel preamble magic check");
+                    }
+                });
             }
-            _ = &mut pty_shutdown_rx => {
-                debug!("Cancelled PTY accept waiting");
+        }
+    });
+
+    // Datagram supervisor for UDP forwarding (RFC 9221)
+    let conn_datagram = conn.clone();
+    let tunnel_manager_datagram = tunnel_manager.clone();
+    let datagram_task = tokio::spawn(async move {
+        while let Ok(data) = conn_datagram.read_datagram().await {
+            if let Some((tunnel_id, payload)) = decode_udp_datagram(&data) {
+                if let Some(sock) = tunnel_manager_datagram.get_udp_tunnel(tunnel_id).await {
+                    if let Some(target) = tunnel_manager_datagram.get_udp_target_addr(tunnel_id).await {
+                        let _ = sock.send_to(payload, target).await;
+                    }
+                }
             }
         }
     });
@@ -470,20 +537,26 @@ async fn handle_connection(
     // Control stream loop: handle heartbeats, window resize, and control commands
     loop {
         tokio::select! {
+            // Outbound control frames to client
+            Some(outbound_msg) = ctrl_rx.recv() => {
+                if let Err(e) = MorshConnection::send_control_message(&mut send, &outbound_msg).await {
+                    warn!(peer = %peer_addr, error = %e, "Failed to send outbound control message");
+                    break;
+                }
+            }
+
+            // Inbound control frames from client
             msg_res = MorshConnection::read_control_message(&mut recv) => {
                 match msg_res {
                     Ok(ControlMessage::Ping { seq, timestamp_ms }) => {
                         debug!(peer = %peer_addr, seq, "Received ping; responding with pong");
                         let pong = ControlMessage::Pong { seq, echo_timestamp_ms: timestamp_ms };
-                        if let Err(e) = MorshConnection::send_control_message(&mut send, &pong).await {
-                            warn!(peer = %peer_addr, error = %e, "Failed to send pong");
-                            break;
-                        }
+                        let _ = ctrl_tx.send(pong).await;
                     }
                     Ok(ControlMessage::WindowResize { cols, rows, .. }) => {
                         *initial_dims.lock().await = (cols, rows);
-                        if let Some(ref handle) = *pty_handle.lock().await {
-                            if let Err(e) = handle.resize(cols, rows) {
+                        if let Some(ref session) = *active_session.lock().await {
+                            if let Err(e) = session.resize(cols, rows) {
                                 warn!(peer = %peer_addr, error = %e, "Failed to resize PTY");
                             } else {
                                 debug!(peer = %peer_addr, cols, rows, "Resized remote PTY");
@@ -493,9 +566,154 @@ async fn handle_connection(
                     Ok(ControlMessage::PtyRequest { term, cols, rows, .. }) => {
                         *initial_dims.lock().await = (cols, rows);
                         *initial_term.lock().await = term;
-                        if let Some(ref handle) = *pty_handle.lock().await {
-                            let _ = handle.resize(cols, rows);
+                        if let Some(ref session) = *active_session.lock().await {
+                            let _ = session.resize(cols, rows);
                         }
+                    }
+                    Ok(ControlMessage::SessionDetachRequest) => {
+                        info!(peer = %peer_addr, session = %session_hex, "Client requested voluntary session detach");
+                        if let Some(ref session) = *active_session.lock().await {
+                            session.detach().await;
+                        }
+                        let resp = ControlMessage::Disconnect {
+                            reason_code: 0,
+                            message: "Session detached successfully".into(),
+                        };
+                        let _ = ctrl_tx.send(resp).await;
+                        break;
+                    }
+                    Ok(ControlMessage::SessionResumeRequest { session_id: req_session_id, resumption_token: req_token }) => {
+                        debug!(peer = %peer_addr, target_session = %hex_encode(&req_session_id), "Received SessionResumeRequest");
+                        match session_registry.resume(&req_session_id, &req_token).await {
+                            Ok(resumed) => {
+                                *active_session.lock().await = Some(Arc::clone(&resumed));
+                                let (cols, rows) = *initial_dims.lock().await;
+                                let _ = resumed.resize(cols, rows);
+
+                                let resp = ControlMessage::SessionResumeResponse {
+                                    success: true,
+                                    session_id: req_session_id,
+                                    resumption_token: req_token,
+                                    message: "Session resumed successfully".into(),
+                                };
+                                let _ = ctrl_tx.send(resp).await;
+
+                                let (cols, rows) = resumed.size();
+                                let (cursor_x, cursor_y) = resumed.cursor_position();
+                                let buffer = resumed.snapshot();
+                                let snapshot = ControlMessage::ScreenSnapshot {
+                                    cols,
+                                    rows,
+                                    cursor_x,
+                                    cursor_y,
+                                    buffer,
+                                };
+                                let _ = ctrl_tx.send(snapshot).await;
+                            }
+                            Err(e) => {
+                                warn!(peer = %peer_addr, error = %e, "Failed to resume persistent session");
+                                let resp = ControlMessage::SessionResumeResponse {
+                                    success: false,
+                                    session_id: req_session_id,
+                                    resumption_token: [0u8; 16],
+                                    message: e.to_string(),
+                                };
+                                let _ = ctrl_tx.send(resp).await;
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::SessionListRequest) => {
+                        debug!(peer = %peer_addr, user = %authenticated_user, "Received SessionListRequest");
+                        let sessions = session_registry.list(Some(&authenticated_user)).await;
+                        let resp = ControlMessage::SessionListResponse { sessions };
+                        let _ = ctrl_tx.send(resp).await;
+                    }
+                    Ok(ControlMessage::NoShell) => {
+                        info!(peer = %peer_addr, "Client requested no interactive shell (-N / tunnel-only mode)");
+                        no_shell_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(ControlMessage::TunnelOpenRequest { tunnel_id, tunnel_type, host, port }) => {
+                        debug!(peer = %peer_addr, tunnel_id, ?tunnel_type, %host, port, "Received TunnelOpenRequest");
+                        match tunnel_type {
+                            TunnelType::LocalTcp | TunnelType::Socks5 => {
+                                let target_addr = format!("{}:{}", host, port);
+                                match tokio::net::TcpStream::connect(&target_addr).await {
+                                    Ok(tcp_stream) => {
+                                        debug!(tunnel_id, target = %target_addr, "Connected to tunnel target");
+                                        tunnel_manager.register_server_stream(tunnel_id, tcp_stream).await;
+                                        let resp = ControlMessage::TunnelOpenResponse {
+                                            tunnel_id,
+                                            success: true,
+                                            message: "Connected".into(),
+                                        };
+                                        let _ = ctrl_tx.send(resp).await;
+                                    }
+                                    Err(e) => {
+                                        warn!(tunnel_id, target = %target_addr, error = %e, "Failed to connect to tunnel target");
+                                        let resp = ControlMessage::TunnelOpenResponse {
+                                            tunnel_id,
+                                            success: false,
+                                            message: format!("Connection failed: {}", e),
+                                        };
+                                        let _ = ctrl_tx.send(resp).await;
+                                    }
+                                }
+                            }
+                            TunnelType::UdpForward => {
+                                match setup_server_udp_tunnel(tunnel_id, host, port, conn.clone(), tunnel_manager.clone()).await {
+                                    Ok(()) => {
+                                        let resp = ControlMessage::TunnelOpenResponse {
+                                            tunnel_id,
+                                            success: true,
+                                            message: "UDP socket bound".into(),
+                                        };
+                                        let _ = ctrl_tx.send(resp).await;
+                                    }
+                                    Err(e) => {
+                                        let resp = ControlMessage::TunnelOpenResponse {
+                                            tunnel_id,
+                                            success: false,
+                                            message: e.to_string(),
+                                        };
+                                        let _ = ctrl_tx.send(resp).await;
+                                    }
+                                }
+                            }
+                            TunnelType::RemoteTcp => {
+                                // Handled on client
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::TunnelOpenResponse { tunnel_id, success, message }) => {
+                        tunnel_manager.on_tunnel_open_response(tunnel_id, success, message).await;
+                    }
+                    Ok(ControlMessage::TunnelClose { tunnel_id }) => {
+                        tunnel_manager.remove_tunnel(tunnel_id).await;
+                    }
+                    Ok(ControlMessage::RemoteForwardRequest { bind_addr, bind_port, target_host, target_port }) => {
+                        debug!(peer = %peer_addr, %bind_addr, bind_port, %target_host, target_port, "Received RemoteForwardRequest");
+                        match bind_remote_forward_server(bind_addr, bind_port, target_host, target_port, conn.clone(), tunnel_manager.clone()).await {
+                            Ok(actual_port) => {
+                                let resp = ControlMessage::RemoteForwardResponse {
+                                    bind_port: actual_port,
+                                    success: true,
+                                    message: format!("Bound remote port {}", actual_port),
+                                };
+                                let _ = ctrl_tx.send(resp).await;
+                            }
+                            Err(e) => {
+                                let resp = ControlMessage::RemoteForwardResponse {
+                                    bind_port,
+                                    success: false,
+                                    message: e.to_string(),
+                                };
+                                let _ = ctrl_tx.send(resp).await;
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::PredictInputSeq { seq, len: _ }) => {
+                        debug!(peer = %peer_addr, seq, "Acknowledging prediction sequence");
+                        let _ = ctrl_tx.send(ControlMessage::PredictAck { ack_seq: seq }).await;
                     }
                     Ok(ControlMessage::Disconnect { reason_code, message }) => {
                         info!(
@@ -518,11 +736,21 @@ async fn handle_connection(
         }
     }
 
-    let _ = pty_shutdown_tx.send(());
-    let _ = pty_task.await;
+    if let Some(ref session) = *active_session.lock().await {
+        session.detach().await;
+        if session.has_exited() {
+            session_registry.remove(&session.session_id()).await;
+        }
+    }
+
+    if let Some(tx) = pty_shutdown_tx_opt.lock().await.take() {
+        let _ = tx.send(());
+    }
+    stream_task.abort();
+    datagram_task.abort();
 
     let _ = send.finish();
-    info!(peer = %peer_addr, session = %session_hex, user = %authenticated_user, "Session terminated");
+    info!(peer = %peer_addr, session = %session_hex, user = %authenticated_user, "Session terminated or detached");
     Ok(())
 }
 
@@ -591,6 +819,16 @@ async fn main() -> Result<()> {
         no_auth: args.no_auth,
     });
 
+    let session_registry = SessionRegistry::new();
+    let reaper_registry = session_registry.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            reaper_registry.reap_dead_sessions().await;
+        }
+    });
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -602,8 +840,9 @@ async fn main() -> Result<()> {
                 match conn_res {
                     Some(Ok(conn)) => {
                         let opts = Arc::clone(&auth_opts);
+                        let reg = session_registry.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(conn, opts).await {
+                            if let Err(e) = handle_connection(conn, opts, reg).await {
                                 error!("Connection handler error: {:#}", e);
                             }
                         });

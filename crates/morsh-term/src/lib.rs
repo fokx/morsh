@@ -2,16 +2,20 @@
 //! Implements server-side pseudo-terminal allocation (portable-pty), async I/O bridging,
 //! and window resize signaling.
 
+pub mod buffer;
 pub mod config;
 pub mod error;
 pub mod io;
 pub mod pty;
+pub mod session;
 
+pub use buffer::{new_shared_buffer, SharedTerminalBuffer, TerminalStateBuffer};
 pub use config::{resolve_shell, PtyConfig};
 pub use error::{Result as TermResult, TermError};
 pub use io::{AsyncPtyReader, AsyncPtyWriter};
 pub use portable_pty::ExitStatus;
 pub use pty::{PtyHandle, PtySession};
+pub use session::{PersistentSession, SessionRegistry};
 
 pub fn term_subsystem_version() -> &'static str {
     "0.1.0"
@@ -22,6 +26,19 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_vt100_api() {
+        let mut parser = vt100::Parser::new(24, 80, 1000);
+        parser.process(b"Hello world!\r\nLine 2");
+        let screen = parser.screen();
+        assert_eq!(screen.size(), (24, 80));
+        let (row, col) = screen.cursor_position();
+        assert_eq!(row, 1);
+        assert_eq!(col, 6);
+        let formatted = screen.contents_formatted();
+        assert!(!formatted.is_empty());
+    }
 
     #[test]
     fn test_resolve_default_shell() {

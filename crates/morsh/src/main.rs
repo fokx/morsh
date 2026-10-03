@@ -3,10 +3,17 @@ use clap::Parser;
 use morsh_auth::{
     find_first_default_private_key, load_private_key_file, sign_challenge, AgentClient,
 };
-use morsh_core::protocol::{AuthMethod, AuthRequest, ControlMessage, PROTOCOL_VERSION};
+use morsh_core::protocol::{
+    AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PROTOCOL_VERSION,
+};
 use morsh_transport::{make_client_config, MorshConnection, QuicClient};
+use morsh_tunnel::{
+    decode_udp_datagram, request_remote_forward, run_dynamic_socks5, run_local_forward,
+    run_udp_forward, DynamicRule, ForwardRule, TunnelManager, UdpRule,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -51,9 +58,49 @@ struct Args {
     #[arg(long)]
     stealth_knock: Option<String>,
 
+    /// Local TCP port forwarding [bind_addr:]bind_port:target_host:target_port (-L)
+    #[arg(short = 'L', long = "local-forward", value_name = "SPEC")]
+    local_forward: Vec<String>,
+
+    /// Remote TCP port forwarding [bind_addr:]bind_port:target_host:target_port (-R)
+    #[arg(short = 'R', long = "remote-forward", value_name = "SPEC")]
+    remote_forward: Vec<String>,
+
+    /// Dynamic SOCKS5 proxy port [bind_addr:]bind_port (-D)
+    #[arg(short = 'D', long = "dynamic-forward", value_name = "SPEC")]
+    dynamic_forward: Vec<String>,
+
+    /// Native UDP port forwarding [bind_addr:]bind_port:target_host:target_port
+    #[arg(short = 'U', long = "udp-forward", value_name = "SPEC")]
+    udp_forward: Vec<String>,
+
+    /// Do not allocate an interactive PTY shell (tunnel-only mode)
+    #[arg(short = 'N', long = "no-shell")]
+    no_shell: bool,
+
+    /// Resume an existing detached persistent session by 128-bit session ID (hex string)
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
+
+    /// Cryptographic 128-bit resumption token (hex string) for session resumption
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+
+    /// List active persistent sessions on the server and exit
+    #[arg(long)]
+    list_sessions: bool,
+
     /// Send N ping packets to measure round-trip latency over QUIC (0 starts interactive terminal session)
     #[arg(long, default_value = "0")]
     ping: u64,
+
+    /// Predictive local echo mode: auto, always, or never
+    #[arg(long, default_value = "auto", value_name = "MODE")]
+    predict: String,
+
+    /// Predictive local echo visual style: underline, dim, or none
+    #[arg(long, default_value = "underline", value_name = "STYLE")]
+    predict_style: String,
 
     /// Enable verbose debug logging
     #[arg(short, long)]
@@ -106,6 +153,42 @@ fn parse_destination(dest: &str, port_override: Option<u16>) -> Result<ParsedDes
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hex_decode(s: &str) -> Option<[u8; 16]> {
+    let s = s.trim();
+    if s.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+fn get_session_cache_path(session_id_hex: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".morsh").join("sessions").join(session_id_hex))
+}
+
+fn save_session_token(session_id: &[u8; 16], token: &[u8; 16], destination: &str) {
+    let id_hex = hex_encode(session_id);
+    let token_hex = hex_encode(token);
+    if let Some(path) = get_session_cache_path(&id_hex) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content = format!("{}\n{}\n", token_hex, destination);
+        let _ = std::fs::write(&path, content);
+    }
+}
+
+fn load_session_token(session_id_hex: &str) -> Option<[u8; 16]> {
+    let path = get_session_cache_path(session_id_hex)?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let first_line = content.lines().next()?.trim();
+    hex_decode(first_line)
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -177,12 +260,18 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to open control bidirectional stream")?;
 
+    let resume_session_id = if let Some(ref r_hex) = args.resume {
+        Some(hex_decode(r_hex).context("Invalid --resume session ID hex string (expected 32 hex chars)")?)
+    } else {
+        None
+    };
+
     // Send ClientHello
     let client_hello = ControlMessage::ClientHello {
         version: PROTOCOL_VERSION,
         client_software: format!("morsh-{}", env!("CARGO_PKG_VERSION")),
         knock_path: args.stealth_knock.clone(),
-        resumption_session_id: None,
+        resumption_session_id: resume_session_id,
     };
 
     debug!("Sending ClientHello frame");
@@ -193,11 +282,12 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to receive ServerHello response")?;
 
-    let (session_id, supported_auth) = match server_hello {
+    let (session_id, resumption_token, supported_auth) = match server_hello {
         ControlMessage::ServerHello {
             version,
             server_software,
             session_id,
+            resumption_token,
             supported_auth,
             session_resumed,
         } => {
@@ -206,11 +296,12 @@ async fn main() -> Result<()> {
             println!("   Server Software : {}", server_software);
             println!("   Protocol Version: v{}", version);
             println!("   Session ID      : {}", hex_encode(&session_id));
+            println!("   Resumption Token: {}", hex_encode(&resumption_token));
             println!("   Session Resumed : {}", session_resumed);
             println!("   Auth Supported  : {:?}", supported_auth);
             println!("   Round-Trip Time : {:.2} ms", conn.rtt().as_secs_f64() * 1000.0);
             println!("========================================================");
-            (session_id, supported_auth)
+            (session_id, resumption_token, supported_auth)
         }
         ControlMessage::Disconnect { reason_code, message } => {
             eprintln!("Server disconnected during handshake (code {}): {}", reason_code, message);
@@ -330,8 +421,185 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Cache session token for future resumption
+    save_session_token(&session_id, &resumption_token, &args.destination);
+
+    // If client requested --list-sessions, query server and exit immediately
+    if args.list_sessions {
+        debug!("Requesting session list from server");
+        MorshConnection::send_control_message(&mut send, &ControlMessage::SessionListRequest).await?;
+        let resp = MorshConnection::read_control_message(&mut recv).await?;
+        match resp {
+            ControlMessage::SessionListResponse { sessions } => {
+                println!();
+                println!("Active persistent sessions on {}:", args.destination);
+                if sessions.is_empty() {
+                    println!("  No active persistent sessions.");
+                } else {
+                    println!("{:<34} {:<16} {:<12} {:<10}", "SESSION ID", "USER", "DIMENSIONS", "STATUS");
+                    println!("{}", "-".repeat(74));
+                    for s in sessions {
+                        let status = if s.is_attached { "attached" } else { "detached" };
+                        println!("{:<34} {:<16} {}x{:<9} {:<10}", hex_encode(&s.session_id), s.user, s.cols, s.rows, status);
+                    }
+                }
+                println!();
+            }
+            other => {
+                warn!("Unexpected response to SessionListRequest: {:?}", other);
+            }
+        }
+        let _ = MorshConnection::send_control_message(
+            &mut send,
+            &ControlMessage::Disconnect {
+                reason_code: 0,
+                message: "list_sessions done".into(),
+            },
+        ).await;
+        conn.close(0, "list_sessions complete");
+        return Ok(());
+    }
+
+    // If client requested --resume, request session resumption and receive ScreenSnapshot
+    let mut initial_snapshot: Option<Vec<u8>> = None;
+    if let Some(ref resume_id_hex) = args.resume {
+        let resume_id = hex_decode(resume_id_hex)
+            .context("Invalid --resume session ID hex string (expected 32 hex chars)")?;
+        let resume_tok = if let Some(ref t_hex) = args.token {
+            hex_decode(t_hex).context("Invalid --token hex string (expected 32 hex chars)")?
+        } else if let Some(cached_tok) = load_session_token(resume_id_hex) {
+            debug!("Loaded resumption token from local session cache");
+            cached_tok
+        } else {
+            bail!("Resumption token required to resume session {}. Provide with --token <HEX>", resume_id_hex);
+        };
+
+        debug!("Sending SessionResumeRequest for session {}", resume_id_hex);
+        let resume_req = ControlMessage::SessionResumeRequest {
+            session_id: resume_id,
+            resumption_token: resume_tok,
+        };
+        MorshConnection::send_control_message(&mut send, &resume_req).await?;
+
+        let resume_resp = MorshConnection::read_control_message(&mut recv).await?;
+        match resume_resp {
+            ControlMessage::SessionResumeResponse { success, message, .. } => {
+                if !success {
+                    bail!("Failed to resume session {}: {}", resume_id_hex, message);
+                }
+                println!("Session {} resumed successfully!", resume_id_hex);
+            }
+            other => bail!("Expected SessionResumeResponse, got {:?}", other),
+        }
+
+        let snapshot_msg = MorshConnection::read_control_message(&mut recv).await?;
+        match snapshot_msg {
+            ControlMessage::ScreenSnapshot { buffer, cols, rows, .. } => {
+                debug!(cols, rows, buf_len = buffer.len(), "Received ScreenSnapshot from server");
+                initial_snapshot = Some(buffer);
+            }
+            other => bail!("Expected ScreenSnapshot, got {:?}", other),
+        }
+    }
+
     use std::io::IsTerminal;
     let is_tty = std::io::stdin().is_terminal();
+
+    // Channel for asynchronous control frame transmissions over Stream 0
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<ControlMessage>(64);
+    let tunnel_manager = TunnelManager::new(Some(ctrl_tx.clone()));
+
+    let mut send_stream = send;
+    let ctrl_write_task = tokio::spawn(async move {
+        while let Some(msg) = ctrl_rx.recv().await {
+            if let Err(e) = MorshConnection::send_control_message(&mut send_stream, &msg).await {
+                debug!(error = %e, "Outbound control stream closed");
+                break;
+            }
+        }
+        let _ = send_stream.finish();
+    });
+
+    // Accept server-initiated streams (for remote TCP forward -R)
+    let conn_stream_accept = conn.clone();
+    let tunnel_manager_stream = tunnel_manager.clone();
+    let stream_accept_task = tokio::spawn(async move {
+        while let Ok((stream_send, mut stream_recv)) = conn_stream_accept.accept_bi().await {
+            let mgr = tunnel_manager_stream.clone();
+            tokio::spawn(async move {
+                let mut preamble_bytes = [0u8; 8];
+                if stream_recv.read_exact(&mut preamble_bytes).await.is_ok() {
+                    if let Some(preamble) = TunnelStreamPreamble::from_bytes(&preamble_bytes) {
+                        if let Some(tcp_stream) = mgr.take_server_stream(preamble.tunnel_id).await {
+                            morsh_tunnel::bridge_tcp_and_quic(tcp_stream, stream_send, stream_recv).await;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Datagram supervisor for UDP forwarding return packets
+    let last_client_addr = Arc::new(tokio::sync::Mutex::new(None));
+    let last_client_addr_clone = Arc::clone(&last_client_addr);
+    let conn_datagram = conn.clone();
+    let tunnel_manager_udp = tunnel_manager.clone();
+    let datagram_task = tokio::spawn(async move {
+        while let Ok(data) = conn_datagram.read_datagram().await {
+            if let Some((tunnel_id, payload)) = decode_udp_datagram(&data) {
+                if let Some(sock) = tunnel_manager_udp.get_udp_tunnel(tunnel_id).await {
+                    if let Some(addr) = *last_client_addr_clone.lock().await {
+                        let _ = sock.send_to(payload, addr).await;
+                    }
+                }
+            }
+        }
+    });
+
+    // Notify server if running in tunnel-only mode (-N)
+    if args.no_shell {
+        let _ = ctrl_tx.send(ControlMessage::NoShell).await;
+    }
+
+    // Launch configured tunnels
+    for spec in &args.local_forward {
+        let rule = ForwardRule::parse(spec)?;
+        let c = conn.clone();
+        let tm = tunnel_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_local_forward(rule, c, tm).await {
+                warn!(error = %e, "Local forward failed");
+            }
+        });
+    }
+
+    for spec in &args.dynamic_forward {
+        let rule = DynamicRule::parse(spec)?;
+        let c = conn.clone();
+        let tm = tunnel_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_dynamic_socks5(rule, c, tm).await {
+                warn!(error = %e, "Dynamic SOCKS5 forward failed");
+            }
+        });
+    }
+
+    for spec in &args.remote_forward {
+        let rule = ForwardRule::parse(spec)?;
+        request_remote_forward(&rule, &tunnel_manager).await?;
+    }
+
+    for spec in &args.udp_forward {
+        let rule = UdpRule::parse(spec)?;
+        let c = conn.clone();
+        let tm = tunnel_manager.clone();
+        let lca = Arc::clone(&last_client_addr);
+        tokio::spawn(async move {
+            if let Err(e) = run_udp_forward(rule, c, tm, lca).await {
+                warn!(error = %e, "UDP forward failed");
+            }
+        });
+    }
 
     // Ping test if explicitly requested
     if args.ping > 0 {
@@ -344,7 +612,7 @@ async fn main() -> Result<()> {
                 timestamp_ms: send_ts,
             };
 
-            MorshConnection::send_control_message(&mut send, &ping).await?;
+            let _ = ctrl_tx.send(ping).await;
             let reply = MorshConnection::read_control_message(&mut recv).await?;
 
             match reply {
@@ -362,6 +630,28 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+    } else if args.no_shell {
+        println!("Tunnels established. Running in background (-N / no-shell). Press Ctrl+C to exit.");
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Ctrl+C received; terminating tunnels");
+                    break;
+                }
+                ctrl_res = MorshConnection::read_control_message(&mut recv) => {
+                    match ctrl_res {
+                        Ok(ControlMessage::Disconnect { reason_code, message }) => {
+                            info!(code = reason_code, %message, "Server disconnected");
+                            break;
+                        }
+                        Ok(msg) => {
+                            handle_client_control_msg(msg, &ctrl_tx, &tunnel_manager).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
     } else {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -375,7 +665,7 @@ async fn main() -> Result<()> {
             x_pixels: 0,
             y_pixels: 0,
         };
-        MorshConnection::send_control_message(&mut send, &resize_msg).await?;
+        let _ = ctrl_tx.send(resize_msg).await;
 
         // Open Stream 1 for raw bidirectional PTY byte streaming
         let (mut pty_send, mut pty_recv) = conn
@@ -392,6 +682,11 @@ async fn main() -> Result<()> {
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
 
+        if let Some(ref snapshot) = initial_snapshot {
+            let _ = stdout.write_all(snapshot).await;
+            let _ = stdout.flush().await;
+        }
+
         #[cfg(unix)]
         let mut sigwinch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -400,6 +695,12 @@ async fn main() -> Result<()> {
         let mut in_buf = [0u8; 4096];
         let mut out_buf = [0u8; 4096];
         let mut stdin_eof = false;
+        let mut saw_detach_prefix = false;
+        let mut detached_by_user = false;
+
+        let predict_mode = args.predict.parse::<morsh_predict::PredictMode>().unwrap_or_default();
+        let predict_style = args.predict_style.parse::<morsh_predict::PredictStyle>().unwrap_or_default();
+        let mut predict_engine = morsh_predict::PredictionEngine::new(predict_mode, predict_style);
 
         loop {
             tokio::select! {
@@ -407,7 +708,8 @@ async fn main() -> Result<()> {
                 out_res = pty_recv.read(&mut out_buf) => {
                     match out_res {
                         Ok(Some(n)) if n > 0 => {
-                            if stdout.write_all(&out_buf[..n]).await.is_err() {
+                            let srv_res = predict_engine.process_server_output(&out_buf[..n]);
+                            if stdout.write_all(&srv_res.output_to_render).await.is_err() {
                                 break;
                             }
                             let _ = stdout.flush().await;
@@ -419,12 +721,59 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Local stdin -> remote PTY stdin
+                // Local stdin -> remote PTY stdin (with Ctrl-^ d escape detection and speculative echo)
                 in_res = stdin.read(&mut in_buf), if !stdin_eof => {
                     match in_res {
                         Ok(n) if n > 0 => {
-                            if pty_send.write_all(&in_buf[..n]).await.is_err() {
-                                stdin_eof = true;
+                            let mut write_bytes = Vec::with_capacity(n);
+                            let mut detach_triggered = false;
+
+                            for &b in &in_buf[..n] {
+                                if saw_detach_prefix {
+                                    saw_detach_prefix = false;
+                                    if b == b'd' || b == b'D' || b == b'.' {
+                                        detach_triggered = true;
+                                        break;
+                                    } else if b == 0x1e {
+                                        write_bytes.push(0x1e);
+                                    } else {
+                                        write_bytes.push(0x1e);
+                                        write_bytes.push(b);
+                                    }
+                                } else if b == 0x1e {
+                                    saw_detach_prefix = true;
+                                } else {
+                                    write_bytes.push(b);
+                                }
+                            }
+
+                            if detach_triggered {
+                                detached_by_user = true;
+                                debug!("User triggered session detach escape sequence (Ctrl-^ d)");
+                                let _ = ctrl_tx.send(ControlMessage::SessionDetachRequest).await;
+                                break;
+                            }
+
+                            if !write_bytes.is_empty() {
+                                if is_tty {
+                                    let input_res = predict_engine.process_input(&write_bytes);
+                                    if !input_res.speculative_render.is_empty() {
+                                        let _ = stdout.write_all(&input_res.speculative_render).await;
+                                        let _ = stdout.flush().await;
+                                    }
+                                    if let Some(seq) = input_res.highest_seq {
+                                        let _ = ctrl_tx
+                                            .send(ControlMessage::PredictInputSeq {
+                                                seq,
+                                                len: input_res.predictions.len() as u32,
+                                            })
+                                            .await;
+                                    }
+                                }
+
+                                if pty_send.write_all(&write_bytes).await.is_err() {
+                                    stdin_eof = true;
+                                }
                             }
                         }
                         _ => {
@@ -444,28 +793,50 @@ async fn main() -> Result<()> {
                         x_pixels: 0,
                         y_pixels: 0,
                     };
-                    let _ = MorshConnection::send_control_message(&mut send, &resize_event).await;
+                    let _ = ctrl_tx.send(resize_event).await;
                 }
 
-                // Control stream notifications (e.g. Disconnect or Ping)
+                // Control stream notifications (e.g. Disconnect, Ping, Tunnel responses, PredictAck)
                 ctrl_res = MorshConnection::read_control_message(&mut recv) => {
                     match ctrl_res {
                         Ok(ControlMessage::Disconnect { reason_code, message }) => {
                             debug!(code = reason_code, %message, "Server notified disconnect");
                             break;
                         }
-                        Ok(ControlMessage::Ping { seq, timestamp_ms }) => {
-                            let pong = ControlMessage::Pong { seq, echo_timestamp_ms: timestamp_ms };
-                            let _ = MorshConnection::send_control_message(&mut send, &pong).await;
+                        Ok(ControlMessage::PredictAck { ack_seq }) => {
+                            predict_engine.handle_ack(ack_seq);
                         }
-                        _ => {
+                        Ok(msg) => {
+                            handle_client_control_msg(msg, &ctrl_tx, &tunnel_manager).await;
+                        }
+                        Err(_) => {
                             break;
                         }
                     }
                 }
             }
         }
+
+        let cleanup_bytes = predict_engine.reset();
+        if !cleanup_bytes.is_empty() {
+            let _ = stdout.write_all(&cleanup_bytes).await;
+            let _ = stdout.flush().await;
+        }
+
+        drop(_guard);
+        if detached_by_user {
+            stream_accept_task.abort();
+            datagram_task.abort();
+            println!("\r\n[morsh: detached session {}]", hex_encode(&session_id));
+            println!("[To resume, run: morsh {} --resume {}]\r\n", args.destination, hex_encode(&session_id));
+            drop(ctrl_tx);
+            conn.close(0, "session detached");
+            return Ok(());
+        }
     }
+
+    stream_accept_task.abort();
+    datagram_task.abort();
 
     // Graceful disconnect
     debug!("Sending graceful Disconnect frame");
@@ -473,14 +844,90 @@ async fn main() -> Result<()> {
         reason_code: 0,
         message: "client finished".into(),
     };
-    let _ = MorshConnection::send_control_message(&mut send, &disconnect).await;
-    let _ = send.finish();
+    let _ = ctrl_tx.send(disconnect).await;
+    drop(ctrl_tx);
+    let _ = ctrl_write_task.await;
 
     conn.close(0, "normal client exit");
     if !is_tty && args.ping > 0 {
         println!("Session cleanly terminated.");
     }
     Ok(())
+}
+
+async fn handle_client_control_msg(
+    msg: ControlMessage,
+    ctrl_tx: &tokio::sync::mpsc::Sender<ControlMessage>,
+    tunnel_manager: &TunnelManager,
+) {
+    match msg {
+        ControlMessage::Ping { seq, timestamp_ms } => {
+            let pong = ControlMessage::Pong {
+                seq,
+                echo_timestamp_ms: timestamp_ms,
+            };
+            let _ = ctrl_tx.send(pong).await;
+        }
+        ControlMessage::TunnelOpenResponse {
+            tunnel_id,
+            success,
+            message,
+        } => {
+            tunnel_manager
+                .on_tunnel_open_response(tunnel_id, success, message)
+                .await;
+        }
+        ControlMessage::RemoteForwardResponse {
+            bind_port,
+            success,
+            message,
+        } => {
+            tunnel_manager
+                .on_remote_forward_response(bind_port, success, message)
+                .await;
+        }
+        ControlMessage::TunnelOpenRequest {
+            tunnel_id,
+            tunnel_type,
+            host,
+            port,
+        } => {
+            if tunnel_type == TunnelType::RemoteTcp {
+                let target_addr = format!("{}:{}", host, port);
+                match tokio::net::TcpStream::connect(&target_addr).await {
+                    Ok(tcp_stream) => {
+                        tunnel_manager
+                            .register_server_stream(tunnel_id, tcp_stream)
+                            .await;
+                        let resp = ControlMessage::TunnelOpenResponse {
+                            tunnel_id,
+                            success: true,
+                            message: "Connected to local target".into(),
+                        };
+                        let _ = ctrl_tx.send(resp).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            tunnel_id,
+                            target = %target_addr,
+                            error = %e,
+                            "Failed to connect to local target for -R"
+                        );
+                        let resp = ControlMessage::TunnelOpenResponse {
+                            tunnel_id,
+                            success: false,
+                            message: e.to_string(),
+                        };
+                        let _ = ctrl_tx.send(resp).await;
+                    }
+                }
+            }
+        }
+        ControlMessage::TunnelClose { tunnel_id } => {
+            tunnel_manager.remove_tunnel(tunnel_id).await;
+        }
+        _ => {}
+    }
 }
 
 /// RAII guard ensuring terminal raw mode is cleanly disabled when dropped.

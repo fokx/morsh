@@ -55,6 +55,7 @@ async fn test_ed25519_auth_flow_success() {
             version: PROTOCOL_VERSION,
             server_software: "morshd-test".into(),
             session_id,
+            resumption_token: [0u8; 16],
             supported_auth: vec![AuthMethod::PublicKey {
                 supported_algorithms: vec!["ssh-ed25519".into()],
             }],
@@ -186,6 +187,7 @@ async fn test_unauthorized_key_rejected() {
             version: PROTOCOL_VERSION,
             server_software: "morshd-test".into(),
             session_id,
+            resumption_token: [0u8; 16],
             supported_auth: vec![AuthMethod::PublicKey { supported_algorithms: vec![] }],
             session_resumed: false,
         };
@@ -282,6 +284,7 @@ async fn test_password_auth_flow() {
             version: PROTOCOL_VERSION,
             server_software: "morshd-test".into(),
             session_id,
+            resumption_token: [0u8; 16],
             supported_auth: vec![AuthMethod::Password],
             session_resumed: false,
         };
@@ -370,6 +373,7 @@ async fn test_stealth_knock_with_public_key_auth() {
                 version: PROTOCOL_VERSION,
                 server_software: "morshd".into(),
                 session_id,
+                resumption_token: [0u8; 16],
                 supported_auth: vec![AuthMethod::PublicKey { supported_algorithms: vec![] }],
                 session_resumed: false,
             };
