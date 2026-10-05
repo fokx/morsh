@@ -6,7 +6,10 @@ use morsh_auth::{
 use morsh_core::protocol::{
     AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PROTOCOL_VERSION,
 };
-use morsh_transport::{make_client_config, MorshConnection, QuicClient};
+use morsh_transport::{
+    connect_happy_eyeballs, make_client_config_from_rustls, make_rustls_client_config,
+    MorshConnection, QuicClient,
+};
 use morsh_tunnel::{
     decode_udp_datagram, request_remote_forward, run_dynamic_socks5, run_local_forward,
     run_udp_forward, DynamicRule, ForwardRule, TunnelManager, UdpRule,
@@ -57,6 +60,14 @@ struct Args {
     /// Optional stealth knock path prefix (SSH3 style anti-scanning defense)
     #[arg(long)]
     stealth_knock: Option<String>,
+
+    /// Force TLS 1.3 over TCP fallback (bypasses QUIC/UDP)
+    #[arg(long)]
+    force_tcp: bool,
+
+    /// Happy Eyeballs TCP fallback threshold in milliseconds (default: 300 ms)
+    #[arg(long, default_value = "300", value_name = "MS")]
+    tcp_fallback_timeout: u64,
 
     /// Local TCP port forwarding [bind_addr:]bind_port:target_host:target_port (-L)
     #[arg(short = 'L', long = "local-forward", value_name = "SPEC")]
@@ -233,26 +244,35 @@ async fn main() -> Result<()> {
         .next()
         .with_context(|| format!("Could not find any IP address for '{}'", target))?;
 
-    info!(remote_addr = %remote_addr, "Connecting via QUIC (TLS 1.3)...");
-
-    let client_config = make_client_config(args.insecure)
+    let rustls_client_config = make_rustls_client_config(args.insecure)
+        .context("Failed to initialize client TLS transport configuration")?;
+    let quic_client_config = make_client_config_from_rustls(rustls_client_config.clone())
         .context("Failed to initialize QUIC client transport configuration")?;
 
-    let client = QuicClient::new(client_config)
+    let client = QuicClient::new(quic_client_config)
         .context("Failed to bind client endpoint")?;
 
+    let fallback_delay = Duration::from_millis(args.tcp_fallback_timeout);
+
     let conn_start = Instant::now();
-    let conn = client
-        .connect(remote_addr, &sni_name)
-        .await
-        .context("Failed to establish QUIC connection with morsh server")?;
+    let conn = connect_happy_eyeballs(
+        remote_addr,
+        &sni_name,
+        &client,
+        rustls_client_config,
+        fallback_delay,
+        args.force_tcp,
+    )
+    .await
+    .context("Failed to establish connection with morsh server")?;
     let conn_elapsed = conn_start.elapsed();
 
     info!(
         remote = %conn.remote_address(),
+        transport = conn.transport_name(),
         handshake_time_ms = conn_elapsed.as_millis(),
         initial_rtt_ms = conn.rtt().as_millis(),
-        "QUIC handshake successful"
+        "Transport handshake successful"
     );
 
     let (mut send, mut recv) = conn
@@ -295,6 +315,7 @@ async fn main() -> Result<()> {
             println!(" Connected to morshd server!");
             println!("   Server Software : {}", server_software);
             println!("   Protocol Version: v{}", version);
+            println!("   Transport       : {}", conn.transport_name());
             println!("   Session ID      : {}", hex_encode(&session_id));
             println!("   Resumption Token: {}", hex_encode(&resumption_token));
             println!("   Session Resumed : {}", session_resumed);

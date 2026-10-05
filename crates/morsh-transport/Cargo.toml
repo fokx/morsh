@@ -9,6 +9,7 @@ authors.workspace = true
 morsh-core.workspace = true
 quinn.workspace = true
 rustls.workspace = true
+tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
 rcgen.workspace = true
 ring.workspace = true

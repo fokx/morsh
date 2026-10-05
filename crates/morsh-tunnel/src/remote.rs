@@ -6,7 +6,6 @@ use morsh_core::protocol::{
     ControlMessage, TunnelStreamPreamble, TunnelType,
 };
 use morsh_transport::MorshConnection;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 

@@ -6,8 +6,9 @@ use morsh_core::protocol::{
 };
 use morsh_term::{PersistentSession, PtyConfig, SessionRegistry};
 use morsh_transport::{
-    cert_fingerprint_sha256, generate_self_signed_cert, generate_session_id, make_server_config,
-    MorshConnection, QuicServer,
+    cert_fingerprint_sha256, generate_self_signed_cert, generate_session_id,
+    make_rustls_server_config, make_server_config_from_rustls, MorshConnection, QuicServer,
+    TcpServer,
 };
 use morsh_tunnel::{
     bind_remote_forward_server, bridge_tcp_and_quic, decode_udp_datagram,
@@ -32,6 +33,10 @@ struct Args {
     /// Socket address to listen on for incoming UDP/QUIC traffic
     #[arg(short, long, default_value = "0.0.0.0:2222")]
     listen: String,
+
+    /// Optional explicit socket address to listen on for TCP fallback (defaults to same port as --listen)
+    #[arg(long)]
+    tcp_listen: Option<String>,
 
     /// Optional path to TLS certificate chain in PEM format
     #[arg(short = 'c', long)]
@@ -783,19 +788,31 @@ async fn main() -> Result<()> {
         info!("Host Key Fingerprint (SHA-256): {}", fingerprint);
     }
 
-    let server_config = make_server_config(certs, key)
-        .context("Failed to construct server transport configuration")?;
+    let server_rustls = make_rustls_server_config(certs, key)
+        .context("Failed to construct server TLS transport configuration")?;
+    let quic_server_config = make_server_config_from_rustls(server_rustls.clone())
+        .context("Failed to construct server QUIC transport configuration")?;
 
     let listen_addr: SocketAddr = args
         .listen
         .parse()
         .with_context(|| format!("Invalid listen address: {}", args.listen))?;
 
-    let server = QuicServer::bind(listen_addr, server_config)
-        .context("Failed to start QUIC server listener")?;
+    let tcp_listen_str = args.tcp_listen.as_deref().unwrap_or(&args.listen);
+    let tcp_listen_addr: SocketAddr = tcp_listen_str
+        .parse()
+        .with_context(|| format!("Invalid TCP fallback listen address: {}", tcp_listen_str))?;
 
-    let local_addr = server.local_addr()?;
-    info!("morshd listening on quic://{}", local_addr);
+    let quic_server = QuicServer::bind(listen_addr, quic_server_config)
+        .context("Failed to start QUIC server listener")?;
+    let tcp_server = TcpServer::bind(tcp_listen_addr, server_rustls)
+        .await
+        .context("Failed to start TCP fallback server listener")?;
+
+    let local_quic_addr = quic_server.local_addr()?;
+    let local_tcp_addr = tcp_server.local_addr()?;
+    info!("morshd listening on quic://{}", local_quic_addr);
+    info!("morshd listening on tcp://{} (TLS 1.3 fallback)", local_tcp_addr);
     if let Some(ref knock) = args.stealth_knock {
         info!("Stealth knock enabled: requires path '{}'", knock);
     }
@@ -833,10 +850,10 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl+C received; shutting down morshd gracefully");
-                server.close(0, b"daemon shutdown");
+                quic_server.close(0, b"daemon shutdown");
                 break;
             }
-            conn_res = server.accept() => {
+            conn_res = quic_server.accept() => {
                 match conn_res {
                     Some(Ok(conn)) => {
                         let opts = Arc::clone(&auth_opts);
@@ -851,7 +868,27 @@ async fn main() -> Result<()> {
                         warn!("Error accepting QUIC connection: {:#}", e);
                     }
                     None => {
-                        info!("Server endpoint closed");
+                        info!("QUIC server endpoint closed");
+                        break;
+                    }
+                }
+            }
+            conn_res = tcp_server.accept() => {
+                match conn_res {
+                    Some(Ok(conn)) => {
+                        let opts = Arc::clone(&auth_opts);
+                        let reg = session_registry.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(conn, opts, reg).await {
+                                error!("Connection handler error: {:#}", e);
+                            }
+                        });
+                    }
+                    Some(Err(e)) => {
+                        warn!("Error accepting TCP connection: {:#}", e);
+                    }
+                    None => {
+                        info!("TCP fallback server endpoint closed");
                         break;
                     }
                 }

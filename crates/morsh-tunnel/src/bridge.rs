@@ -1,14 +1,14 @@
-use quinn::{RecvStream, SendStream};
+use morsh_transport::{MorshRecvStream, MorshSendStream};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-/// Bridges bytes bidirectionally between a local or remote TcpStream and a pair of Quinn QUIC streams.
+/// Bridges bytes bidirectionally between a local or remote TcpStream and a pair of morsh streams (QUIC or TCP fallback).
 /// Returns total bytes transferred: `(tcp_to_quic_bytes, quic_to_tcp_bytes)`.
 pub async fn bridge_tcp_and_quic(
     mut tcp_stream: TcpStream,
-    mut quic_send: SendStream,
-    mut quic_recv: RecvStream,
+    mut quic_send: MorshSendStream,
+    mut quic_recv: MorshRecvStream,
 ) -> (u64, u64) {
     let (mut tcp_read, mut tcp_write) = tcp_stream.split();
 

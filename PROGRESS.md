@@ -16,8 +16,8 @@
 | **Phase 4** | Port Forwarding & Tunnels (TCP, UDP, SOCKS5) | ✅ **Completed** | 2026-10-06 | - | `morsh-tunnel`, `-L`, `-R`, `-D`, `-U`, `-N`, 57 tests |
 | **Phase 5** | Session Persistence & Screen State Recovery | ✅ **Completed** | 2026-10-06 | - | Detached PTY supervisor, 128-bit session tokens, `vt100` state sync, 65 tests |
 | **Phase 6** | Predictive Local Echo & Speculative UI | ✅ **Completed** | 2026-10-06 | - | Predictive echo engine, underline/dim styling, confidence heuristics, 1-RTT rollback, 92 tests |
-| **Phase 7** | TCP Fallback & Network Resilience | 🎯 **Active / Next** | Pending | - | Happy Eyeballs auto-detection, TLS 1.3 over TCP fallback |
-| **Phase 8** | CLI Polish, Configuration & Packaging | ⏳ Pending | - | - | OpenSSH CLI parity, config files, `morshd.service` systemd unit |
+| **Phase 7** | TCP Fallback & Network Resilience | ✅ **Completed** | 2026-10-06 | - | Happy Eyeballs auto-detection, TLS 1.3 over TCP fallback, dual-stack `morshd`, 103 tests |
+| **Phase 8** | CLI Polish, Configuration & Packaging | 🎯 **Active / Next** | Pending | - | OpenSSH CLI parity, config files, `morshd.service` systemd unit |
 
 
 ---
@@ -436,45 +436,127 @@
 
 ---
 
-## 8. Phase 7 Action Plan (Handoff Instructions)
+## 8. Phase 7 Completion Record
 
-When beginning a new conversation to implement **Phase 7: TCP Fallback & Network Resilience**:
+### Delivered Components
+1. **TLS 1.3 over TCP Stream Multiplexer (`crates/morsh-transport`)**:
+   - Built `tcp_mux.rs` implementing a zero-overhead binary framing protocol:
+     - 9-byte header: `[stream_id: u32 BE, flags: u8, length: u32 BE]`.
+     - Frame flags: `FLAG_DATA (0x00)`, `FLAG_FIN (0x01)`, `FLAG_RST (0x02)`, `FLAG_DATAGRAM (0x04)`, `FLAG_PING (0x08)`, `FLAG_PONG (0x10)`.
+     - Fair multiplexing chunk size (`DEFAULT_CHUNK_SIZE = 32 KiB`) preventing large transfers from starving interactive control or PTY streams.
+   - `TcpSendStream`: implements `tokio::io::AsyncWrite`, non-blocking `finish()` (FIN frame), and logical `id().index()`.
+   - `TcpRecvStream`: implements `tokio::io::AsyncRead`, and provides `read(&mut buf) -> IoResult<Option<usize>>` returning `None` on clean peer EOF / FIN.
+   - `TcpConnection`: thread-safe coordinator managing write and read event loops, dynamic peer-initiated stream dispatching, datagram queues, RTT tracking, and graceful flush upon connection closure.
 
-### Primary Objective
-Ensure reliable connectivity in hostile or restrictive network environments where UDP or QUIC is blocked, rate-limited, or throttled by corporate firewalls and middleboxes, using Happy Eyeballs auto-detection and TLS 1.3 over TCP fallback.
+2. **Unified Transport Abstraction (`crates/morsh-transport`)**:
+   - Built `stream.rs`:
+     - `MorshSendStream`: wraps either Quinn `SendStream` or `TcpSendStream`. Implements `AsyncWrite` with inherent `write_all`, `flush`, `finish`, and `id()`.
+     - `MorshRecvStream`: wraps either Quinn `RecvStream` or `TcpRecvStream`. Implements `AsyncRead` with inherent `read` and `read_exact`.
+     - `MorshStreamId`: logical index (0 for Control, 1 for PTY, 2..N for Tunnels).
+   - Refactored `connection.rs`:
+     - `MorshConnection`: transparently wraps `Quic(quinn::Connection)` or `Tcp(Arc<TcpConnection>)`.
+     - Exposes uniform API: `open_bi`, `accept_bi`, `send_datagram`, `read_datagram`, `send_control_message`, `read_control_message`, `close`, `closed`, `rtt`, `remote_address`, `transport_name`, `is_quic`, `is_tcp`.
+   - Built `tcp.rs`:
+     - `TcpServer`: native TLS 1.3 listener using `tokio_rustls 0.26` (`TlsAcceptor`) accepting TCP connections and wrapping into `MorshConnection::from_tcp`.
+     - `TcpClient`: native TLS 1.3 connector using `tokio_rustls 0.26` (`TlsConnector`) connecting via `TcpStream` and wrapping into `MorshConnection::from_tcp`.
+   - Refactored `tls.rs`:
+     - Extracted `make_rustls_server_config` and `make_rustls_client_config` sharing identical ALPN (`b"morsh-v1"`), certificate validation (`SkipServerVerification` or system trust), and TLS 1.3 options across both QUIC and TCP.
 
-### Prerequisites & Dependencies
-- Crates to implement: `crates/morsh-transport`, `crates/morshd`, `crates/morsh`
-- Core concepts:
-  - **Happy Eyeballs Auto-Detection (RFC 8305 style)**:
-    - Client attempts QUIC (UDP) connection with a fast fallback timer (e.g. 250–300 ms).
-    - If QUIC handshake does not establish within the threshold or UDP is blocked, concurrently initiate TLS 1.3 over TCP connection.
-    - First connection to successfully complete TLS handshake wins; loser is cleanly canceled.
-  - **TLS 1.3 over TCP Transport Abstraction**:
-    - Framing layer running standard TLS 1.3 (`rustls`) over Tokio `TcpStream`.
-    - Provide a unified transport trait or enum (`MorshTransport::Quic` vs `MorshTransport::Tcp`) wrapping Stream 0 control, Stream 1 PTY, and stream multiplexing over TCP using binary sub-stream framing.
-  - **Dual-Stack Listener in `morshd`**:
-    - Server listens concurrently on QUIC/UDP and TCP fallback port (e.g. sharing port 2222 or custom port).
-    - Accepts both incoming QUIC connections and incoming TLS/TCP streams.
+3. **Happy Eyeballs Auto-Detection Engine (`crates/morsh-transport`)**:
+   - Built `happy_eyeballs.rs`:
+     - `connect_happy_eyeballs`: implements RFC 8305 racing between QUIC/UDP and TCP fallback.
+     - Prefers QUIC (UDP) with fast fallback threshold timer (`DEFAULT_FALLBACK_DELAY = 300 ms`, configurable via CLI).
+     - If QUIC connection does not complete within threshold or fails immediately, concurrently initiates TLS 1.3 over TCP connection.
+     - First connection to complete TLS handshake wins; loser is cleanly canceled and dropped.
+     - Fast path for `--force-tcp` bypassing QUIC entirely.
 
-### Step-by-Step Task Breakdown
-1. **Transport Abstraction in `crates/morsh-transport`**:
-   - Implement `TcpTlsListener` and `TcpTlsStream` using `tokio_rustls` or `rustls`.
-   - Multiplex sub-streams over single TCP connection (stream ID header for Control, PTY, Tunnels).
-   - Implement Happy Eyeballs connector: `connect_happy_eyeballs(addr, server_name, timeout)`.
-2. **Server Daemon Updates in `crates/morshd`**:
-   - Concurrently bind TCP fallback listener alongside QUIC endpoint.
-   - Dispatch accepted TCP connections through the same authentication, PTY, tunnel, and session persistence pipeline.
-3. **Client CLI Updates in `crates/morsh`**:
-   - Add CLI flag `--force-tcp` and `--tcp-fallback-timeout <ms>`.
-   - Default client behavior uses Happy Eyeballs to automatically select fastest working transport.
-4. **Verification & Tests**:
-   - Unit tests for TCP multiplexing framing and Happy Eyeballs timer.
-   - Integration tests simulating blocked UDP and verifying seamless TCP fallback.
+4. **Dual-Stack Listener in `morshd` (`crates/morshd`)**:
+   - Concurrently binds `QuicServer` and `TcpServer` on default port `0.0.0.0:2222` (or explicit `--tcp-listen`).
+   - Server event loop multiplexes incoming QUIC and TCP connections into the identical authentication, PTY, tunnel, and session persistence pipeline (`handle_connection`).
+   - Added CLI flag `--tcp-listen <addr>` for custom TCP port/address overrides.
+
+5. **Client CLI Integration (`crates/morsh`)**:
+   - Added CLI flags:
+     - `--force-tcp`: forces TLS 1.3 over TCP fallback immediately without attempting QUIC.
+     - `--tcp-fallback-timeout <ms>`: customizable Happy Eyeballs fallback delay (default 300 ms).
+   - Client automatically adopts winning transport and displays `Transport: QUIC` or `Transport: TLS/TCP` in the connection banner.
+   - PTY interactive loop, tunnels, and detached session recovery run seamlessly over both transports.
+
+6. **Port Forwarding & Tunnels Compatibility (`crates/morsh-tunnel`)**:
+   - Updated `bridge_tcp_and_quic` to accept unified `MorshSendStream` and `MorshRecvStream`.
+   - Native UDP forwarding (`-U`) operates seamlessly over TCP fallback using encapsulated `FLAG_DATAGRAM` frames.
+
+7. **Architectural Choices & Tradeoffs Recorded**:
+   - **9-Byte Multiplexing Header with Flag Bits**: Rather than heavy HTTP/2 or Postcard framing overhead on every packet, TCP fallback uses a compact 9-byte binary header (`[stream_id: u32, flags: u8, len: u32]`). Raw bytes are bridged at line rate with zero serialization overhead.
+   - **Parity Stream Allocation (HTTP/2 & QUIC Alignment)**: Client allocates even stream IDs (`0, 2, 4...`), while server allocates odd stream IDs (`1, 3, 5...`). Logical stream index is computed as `stream_id / 2`, ensuring Stream 0 (Control), Stream 1 (PTY), and Stream 2..N (Tunnels) have identical indices across both QUIC and TCP.
+   - **Datagram Encapsulation over TCP (`FLAG_DATAGRAM`)**: In UDP-blocked networks, native UDP packets are wrapped in `FLAG_DATAGRAM` frames and demultiplexed into datagram channels, preserving `-U` UDP port forwarding functionality even when operating over TCP fallback.
+   - **Drain Queue on Close**: To prevent abrupt connection resets dropping final control messages (such as `Disconnect` or `AuthResult`), the TCP write task drains any queued outbound frames before invoking `writer.shutdown()`.
+   - **Unified Enum Stream Wrappers**: Using `MorshSendStream` and `MorshRecvStream` enums rather than generic traits avoids trait bound pollution (`<S: AsyncWrite + Unpin + Send + 'static>`) across `morsh-term`, `morsh-tunnel`, `morshd`, and `morsh`, preserving clean crate boundaries and fast compile times.
+
+8. **Automated Test Suite (103 Tests Passing Workspace-wide)**:
+   - **`morsh-transport` Unit Tests (9 passed)**:
+     - `test_frame_header_encoding_roundtrip`: 9-byte header serialization and decode.
+     - `test_tcp_handshake_and_control_message_exchange`: live TLS/TCP handshake, control message exchange, and bidirectional datagram frame exchange.
+     - `test_happy_eyeballs_quic_winner`: verifies QUIC wins race when UDP is healthy.
+     - `test_happy_eyeballs_force_tcp`: verifies `--force-tcp` bypasses QUIC and connects via TCP.
+     - `test_happy_eyeballs_tcp_fallback_when_quic_unavailable`: verifies automatic TCP fallback when UDP is blocked/unbound.
+   - **`morsh-transport` Integration Tests (`tests/tcp_integration.rs`, 6 passed)**:
+     - `test_tcp_full_handshake_flow_and_pings`: complete ClientHello -> ServerHello -> Ping -> Pong -> Disconnect over TCP.
+     - `test_tcp_multiplexed_bidirectional_streams`: 5 concurrent bidirectional streams transmitting arbitrary data simultaneously over a single TCP connection.
+     - `test_tcp_unreliable_datagram_exchange`: encapsulated datagram transmission over TCP.
+     - `test_tcp_stealth_knock_authorization_flow`: stealth knock path protection over TCP.
+     - `test_tcp_version_mismatch_rejection`: protocol version validation over TCP.
+     - `test_happy_eyeballs_seamless_fallback_when_quic_blocked`: live Happy Eyeballs auto-detection falling back seamlessly to TCP when QUIC is unavailable.
+
+9. **Live CLI End-to-End Verification**:
+   - Started live dual-stack `morshd` listening on `quic://127.0.0.1:5252` and `tcp://127.0.0.1:5252 (TLS 1.3 fallback)`.
+   - Executed live `morsh` client: connected via QUIC (3 ms handshake, sub-2ms RTT).
+   - Executed live `morsh` client with `--force-tcp`: connected via TLS 1.3 over TCP (1 ms handshake, sub-2ms RTT).
+   - Executed piped interactive shell over forced TCP fallback (`printf "echo TCP_FALLBACK_SHELL_PIPELINE_OK\nexit\n" | morsh -p 5252 -k --force-tcp 127.0.0.1`): spawned login shell in pseudo-terminal over TCP, executed command, rendered output, and cleanly exited.
 
 ---
 
-## 9. Work Log (Append History)
+## 9. Phase 8 Action Plan (Handoff Instructions)
+
+When beginning a new conversation to implement **Phase 8: Production Polish, Configuration & Distribution**:
+
+### Primary Objective
+Deliver a production-ready, drop-in replacement CLI and daemon with OpenSSH CLI flag parity, TOML configuration files, systemd daemonization, signal handling, and packaging definitions.
+
+### Prerequisites & Dependencies
+- Crates to implement/update: `crates/morshd`, `crates/morsh`, workspace root
+- Core concepts:
+  - **OpenSSH Flag Parity**:
+    - Complete OpenSSH standard flags: `-p <port>`, `-i <identity>`, `-L <spec>`, `-R <spec>`, `-D <spec>`, `-N` (no shell), `-v` / `-vv` / `-vvv` (verbosity levels), `-C` (compression / zstd), `-4` (IPv4 only), `-6` (IPv6 only), `-o Option=Value` compatibility layer.
+  - **TOML Configuration File Support**:
+    - Client configuration: `~/.morsh/config.toml` (Host blocks, IdentityFile, Port, User, StealthKnock, PredictMode, ForceTcp, ForwardAgent).
+    - Server configuration: `/etc/morsh/morshd.toml` (ListenAddress, Port, TcpListenAddress, AuthorizedKeysFile, AllowPassword, PamService, StealthKnock).
+  - **Systemd Daemonization & Signal Handling in `morshd`**:
+    - Systemd service unit definition: `dist/morshd.service` with security sandboxing (`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, `CapabilityBoundingSet`).
+    - Unix signal handling: `SIGHUP` (graceful configuration reload without dropping active persistent sessions), `SIGTERM` / `SIGINT` (graceful shutdown).
+  - **Packaging & Distribution**:
+    - Shell completions generation (bash, zsh, fish) via `clap_complete`.
+    - Man pages generation (`morsh.1`, `morshd.8`) via `clap_mangen`.
+
+### Step-by-Step Task Breakdown
+1. **OpenSSH CLI Compatibility**:
+   - Expand `clap` command specifications in `crates/morsh/src/main.rs` and `crates/morshd/src/main.rs`.
+   - Support `-o Option=Value` parsing mapping OpenSSH directives to morsh equivalents.
+2. **Configuration Files (`config.toml` / `morshd.toml`)**:
+   - Implement configuration file parser using `serde` and `toml`.
+   - Implement host matching rules (wildcards `Host *.internal`) in client configuration.
+3. **Signal Handling & Systemd**:
+   - Add `SIGHUP` config reloader in `morshd`.
+   - Create `dist/systemd/morshd.service`.
+4. **Shell Completions & Docs**:
+   - Add completion scripts and man pages.
+5. **Verification & Tests**:
+   - Unit tests for configuration file parsing and OpenSSH flag compatibility.
+   - Integration tests verifying signal handling and configuration reload.
+
+---
+
+## 10. Work Log (Append History)
 
 ### 2026-10-05 — Phase 1 Completed
 - Initialized multi-crate workspace (`morsh-core`, `morsh-transport`, `morsh-auth`, `morsh-term`, `morsh-predict`, `morsh-tunnel`, `morshd`, `morsh`).
@@ -572,5 +654,27 @@ Ensure reliable connectivity in hostile or restrictive network environments wher
 - Added 27 new tests: 20 unit tests in `morsh-predict`, 6 integration tests in `predict_integration.rs` (including live QUIC exchange), and 1 in `morsh-core`, reaching 92 passing tests workspace-wide with 0 warnings.
 - Verified live end-to-end execution with `morshd` and `morsh` running piped shell commands with active speculative prediction.
 
-
-
+### 2026-10-06 — Phase 7 Completed
+- Implemented Phase 7 TCP Fallback & Network Resilience across `morsh-transport`, `morsh-tunnel`, `morshd`, and `morsh`.
+- Built lightweight, high-performance binary TCP stream multiplexer (`tcp_mux.rs`):
+  - 9-byte binary frame header (`[stream_id: u32, flags: u8, len: u32]`).
+  - Stream flags: `FLAG_DATA`, `FLAG_FIN`, `FLAG_RST`, `FLAG_DATAGRAM`, `FLAG_PING`, `FLAG_PONG`.
+  - Non-blocking Tokio `AsyncWrite` and `AsyncRead` implementation with bounded buffers and queue drain upon connection termination.
+- Extracted shared TLS 1.3 configuration in `tls.rs`:
+  - `make_rustls_server_config` and `make_rustls_client_config` sharing ALPN `b"morsh-v1"` across QUIC and TCP.
+  - Implemented `TcpServer` (`TlsAcceptor`) and `TcpClient` (`TlsConnector`).
+- Created unified `MorshConnection`, `MorshSendStream`, and `MorshRecvStream` abstractions in `stream.rs` and `connection.rs`:
+  - Uniform stream API (`write_all`, `flush`, `finish`, `read`, `read_exact`) across both QUIC and TCP multiplexer.
+  - Uniform stream indexing (`stream_id / 2`) aligning client even IDs (`0, 2, 4...`) and server odd IDs (`1, 3, 5...`).
+- Built RFC 8305 Happy Eyeballs auto-detection engine (`happy_eyeballs.rs`):
+  - Concurrently races QUIC (UDP) and TLS 1.3 over TCP fallback with configurable threshold timer (`DEFAULT_FALLBACK_DELAY = 300 ms`).
+  - Supports `--force-tcp` fast path bypassing QUIC entirely.
+- Integrated dual-stack listener into `morshd`:
+  - Concurrent `QuicServer` and `TcpServer` bindings over `--listen` and `--tcp-listen`.
+  - Dispatching both QUIC and TCP connections into unified authentication, PTY shell, tunnel, and session persistence pipeline.
+- Integrated TCP fallback and Happy Eyeballs into `morsh` CLI:
+  - Added `--force-tcp` and `--tcp-fallback-timeout <ms>` flags.
+  - Client automatically adopts winning transport and displays `Transport: QUIC` or `Transport: TLS/TCP` in banner.
+  - Transparently bridges PTY shells, persistent session recovery, and `-L`/`-R`/`-D`/`-U` tunnels (with UDP over `FLAG_DATAGRAM`) across both transports.
+- Added 11 new tests: 5 unit tests in `morsh-transport` and 6 integration tests in `tcp_integration.rs`, reaching 103 passing tests workspace-wide with 0 warnings.
+- Verified live end-to-end execution: QUIC connection, forced TCP connection, and piped interactive shell execution over TLS/TCP fallback.

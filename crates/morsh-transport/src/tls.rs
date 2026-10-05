@@ -33,19 +33,25 @@ pub fn cert_fingerprint_sha256(cert: &CertificateDer) -> String {
     hex_chars.join(":")
 }
 
-/// Builds a Quinn ServerConfig with TLS 1.3 and ALPN negotiated for morsh.
-pub fn make_server_config(
+/// Builds a rustls ServerConfig with TLS 1.3 and ALPN negotiated for morsh.
+pub fn make_rustls_server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,
-) -> Result<ServerConfig> {
+) -> Result<Arc<rustls::ServerConfig>> {
     let mut rustls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .context("Failed to configure TLS server certificate")?;
 
     rustls_config.alpn_protocols = vec![morsh_core::ALPN_MORSH.to_vec()];
+    Ok(Arc::new(rustls_config))
+}
 
-    let quic_server_config = QuicServerConfig::try_from(Arc::new(rustls_config))
+/// Builds a Quinn ServerConfig from an existing rustls ServerConfig.
+pub fn make_server_config_from_rustls(
+    rustls_config: Arc<rustls::ServerConfig>,
+) -> Result<ServerConfig> {
+    let quic_server_config = QuicServerConfig::try_from(rustls_config)
         .context("Failed to create QUIC server crypto config")?;
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
@@ -57,6 +63,15 @@ pub fn make_server_config(
     server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
+}
+
+/// Builds a Quinn ServerConfig with TLS 1.3 and ALPN negotiated for morsh.
+pub fn make_server_config(
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig> {
+    let rustls_config = make_rustls_server_config(cert_chain, private_key)?;
+    make_server_config_from_rustls(rustls_config)
 }
 
 /// A certificate verifier that accepts any certificate (used for development or TOFU mode).
@@ -100,8 +115,8 @@ impl ServerCertVerifier for SkipServerVerification {
     }
 }
 
-/// Builds a Quinn ClientConfig with ALPN and custom/insecure verifier.
-pub fn make_client_config(insecure: bool) -> Result<ClientConfig> {
+/// Builds a rustls ClientConfig with ALPN and custom/insecure verifier.
+pub fn make_rustls_client_config(insecure: bool) -> Result<Arc<rustls::ClientConfig>> {
     let mut rustls_config = if insecure {
         rustls::ClientConfig::builder()
             .dangerous()
@@ -119,8 +134,14 @@ pub fn make_client_config(insecure: bool) -> Result<ClientConfig> {
     };
 
     rustls_config.alpn_protocols = vec![morsh_core::ALPN_MORSH.to_vec()];
+    Ok(Arc::new(rustls_config))
+}
 
-    let quic_client_config = QuicClientConfig::try_from(Arc::new(rustls_config))
+/// Builds a Quinn ClientConfig from an existing rustls ClientConfig.
+pub fn make_client_config_from_rustls(
+    rustls_config: Arc<rustls::ClientConfig>,
+) -> Result<ClientConfig> {
+    let quic_client_config = QuicClientConfig::try_from(rustls_config)
         .context("Failed to create QUIC client crypto config")?;
 
     let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
@@ -131,6 +152,12 @@ pub fn make_client_config(insecure: bool) -> Result<ClientConfig> {
     client_config.transport_config(Arc::new(transport));
 
     Ok(client_config)
+}
+
+/// Builds a Quinn ClientConfig with ALPN and custom/insecure verifier.
+pub fn make_client_config(insecure: bool) -> Result<ClientConfig> {
+    let rustls_config = make_rustls_client_config(insecure)?;
+    make_client_config_from_rustls(rustls_config)
 }
 
 #[cfg(test)]
