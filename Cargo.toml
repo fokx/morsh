@@ -16,15 +16,22 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["morsh contributors"]
+description = "Modern remote terminal and shell over QUIC with roaming, predictive echo, and stealth auth"
+repository = "https://github.com/fokx/morsh"
+homepage = "https://github.com/fokx/morsh"
+documentation = "https://docs.rs/morsh"
+readme = "README.md"
+keywords = ["quic", "ssh", "mosh", "terminal", "pty"]
+categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 # Internal workspace crates
-morsh-core = { path = "crates/morsh-core" }
-morsh-transport = { path = "crates/morsh-transport" }
-morsh-auth = { path = "crates/morsh-auth" }
-morsh-term = { path = "crates/morsh-term" }
-morsh-predict = { path = "crates/morsh-predict" }
-morsh-tunnel = { path = "crates/morsh-tunnel" }
+morsh-core = { version = "0.1.0", path = "crates/morsh-core" }
+morsh-transport = { version = "0.1.0", path = "crates/morsh-transport" }
+morsh-auth = { version = "0.1.0", path = "crates/morsh-auth" }
+morsh-term = { version = "0.1.0", path = "crates/morsh-term" }
+morsh-predict = { version = "0.1.0", path = "crates/morsh-predict" }
+morsh-tunnel = { version = "0.1.0", path = "crates/morsh-tunnel" }
 
 # External async / networking dependencies
 tokio = { version = "1.43", features = ["full"] }

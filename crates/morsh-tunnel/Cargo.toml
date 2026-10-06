@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "Port forwarding (local/remote TCP), SOCKS5 proxy, and UDP tunnel engine for morsh"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 morsh-core.workspace = true
