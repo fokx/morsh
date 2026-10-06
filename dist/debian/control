@@ -1,0 +1,28 @@
+Source: morsh
+Section: net
+Priority: optional
+Maintainer: morsh contributors <team@morsh.dev>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.80)
+Standards-Version: 4.6.2
+Homepage: https://github.com/morsh/morsh
+
+Package: morsh
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Next-generation resilient QUIC SSH client
+ morsh combines the strongest innovations of Mosh and SSH3:
+ - QUIC and TLS 1.3 encryption with 0-RTT/1-RTT handshakes
+ - Network roaming across Wi-Fi, cellular, and wired interfaces
+ - Speculative local echo engine eliminating typing latency
+ - Transparent TLS 1.3 over TCP fallback
+ - TCP, UDP, and dynamic SOCKS5 port forwarding
+
+Package: morshd
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: Next-generation resilient QUIC SSH daemon
+ morshd is the system daemon for the morsh remote access protocol:
+ - Stealth anti-port-scanning secret knocking
+ - SSH public key and Linux PAM authentication
+ - Persistent PTY sessions surviving network drops and sleep
+ - Screen state tracking and instant resumption snapshots

@@ -1,0 +1,124 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH morsh 1  "morsh 0.1.0" 
+.SH NAME
+morsh \- morsh \- Next\-generation resilient QUIC SSH client (combining Mosh & SSH3)
+.SH SYNOPSIS
+\fBmorsh\fR [\fB\-p\fR|\fB\-\-port\fR] [\fB\-i\fR|\fB\-\-identity\fR] [\fB\-F\fR|\fB\-\-config\fR] [\fB\-o\fR|\fB\-\-option\fR] [\fB\-C\fR|\fB\-\-compress\fR] [\fB\-4\fR|\fB\-\-ipv4\fR] [\fB\-6\fR|\fB\-\-ipv6\fR] [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-\-completions\fR] [\fB\-\-man\fR] [\fB\-\-password\fR] [\fB\-\-no\-agent\fR] [\fB\-k\fR|\fB\-\-insecure\fR] [\fB\-s\fR|\fB\-\-server\-name\fR] [\fB\-\-stealth\-knock\fR] [\fB\-\-force\-tcp\fR] [\fB\-\-tcp\-fallback\-timeout\fR] [\fB\-L\fR|\fB\-\-local\-forward\fR] [\fB\-R\fR|\fB\-\-remote\-forward\fR] [\fB\-D\fR|\fB\-\-dynamic\-forward\fR] [\fB\-U\fR|\fB\-\-udp\-forward\fR] [\fB\-N\fR|\fB\-\-no\-shell\fR] [\fB\-\-resume\fR] [\fB\-\-token\fR] [\fB\-\-list\-sessions\fR] [\fB\-\-ping\fR] [\fB\-\-predict\fR] [\fB\-\-predict\-style\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIDESTINATION\fR] [\fICOMMAND\fR] 
+.SH DESCRIPTION
+morsh \- Next\-generation resilient QUIC SSH client (combining Mosh & SSH3)
+.SH OPTIONS
+.TP
+\fB\-p\fR, \fB\-\-port\fR \fI<PORT>\fR
+Override remote port (defaults to 2222 or port from destination / config)
+.TP
+\fB\-i\fR, \fB\-\-identity\fR \fI<IDENTITY>\fR
+Path to SSH private key file (e.g. ~/.ssh/id_ed25519)
+.TP
+\fB\-F\fR, \fB\-\-config\fR \fI<CONFIG>\fR
+Path to alternative client configuration file (defaults to ~/.morsh/config.toml)
+.TP
+\fB\-o\fR, \fB\-\-option\fR \fI<KEY=VALUE>\fR
+OpenSSH compatibility options in format Option=Value
+.TP
+\fB\-C\fR, \fB\-\-compress\fR
+Request stream compression
+.TP
+\fB\-4\fR, \fB\-\-ipv4\fR
+Force IPv4 address resolution only
+.TP
+\fB\-6\fR, \fB\-\-ipv6\fR
+Force IPv6 address resolution only
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Increase verbosity level (\-v: info, \-vv: debug, \-vvv: trace)
+.TP
+\fB\-\-completions\fR \fI<SHELL>\fR
+Generate shell completions for the specified shell (bash, zsh, fish) and exit
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+bash
+.IP \(bu 2
+elvish
+.IP \(bu 2
+fish
+.IP \(bu 2
+powershell
+.IP \(bu 2
+zsh
+.RE
+.TP
+\fB\-\-man\fR
+Generate man page (roff format) to stdout and exit
+.TP
+\fB\-\-password\fR \fI<PASSWORD>\fR
+Password for password / PAM authentication
+.TP
+\fB\-\-no\-agent\fR
+Disable querying local ssh\-agent ($SSH_AUTH_SOCK)
+.TP
+\fB\-k\fR, \fB\-\-insecure\fR
+Accept any server certificate without validation (insecure / testing mode)
+.TP
+\fB\-s\fR, \fB\-\-server\-name\fR \fI<SERVER_NAME>\fR
+TLS Server Name Indication (SNI) override
+.TP
+\fB\-\-stealth\-knock\fR \fI<STEALTH_KNOCK>\fR
+Optional stealth knock path prefix (SSH3 style anti\-scanning defense)
+.TP
+\fB\-\-force\-tcp\fR
+Force TLS 1.3 over TCP fallback (bypasses QUIC/UDP)
+.TP
+\fB\-\-tcp\-fallback\-timeout\fR \fI<MS>\fR [default: 300]
+Happy Eyeballs TCP fallback threshold in milliseconds (default: 300 ms)
+.TP
+\fB\-L\fR, \fB\-\-local\-forward\fR \fI<SPEC>\fR
+Local TCP port forwarding [bind_addr:]bind_port:target_host:target_port (\-L)
+.TP
+\fB\-R\fR, \fB\-\-remote\-forward\fR \fI<SPEC>\fR
+Remote TCP port forwarding [bind_addr:]bind_port:target_host:target_port (\-R)
+.TP
+\fB\-D\fR, \fB\-\-dynamic\-forward\fR \fI<SPEC>\fR
+Dynamic SOCKS5 proxy port [bind_addr:]bind_port (\-D)
+.TP
+\fB\-U\fR, \fB\-\-udp\-forward\fR \fI<SPEC>\fR
+Native UDP port forwarding [bind_addr:]bind_port:target_host:target_port (\-U)
+.TP
+\fB\-N\fR, \fB\-\-no\-shell\fR
+Do not allocate an interactive PTY shell (tunnel\-only mode)
+.TP
+\fB\-\-resume\fR \fI<SESSION_ID>\fR
+Resume an existing detached persistent session by 128\-bit session ID (hex string)
+.TP
+\fB\-\-token\fR \fI<TOKEN>\fR
+Cryptographic 128\-bit resumption token (hex string) for session resumption
+.TP
+\fB\-\-list\-sessions\fR
+List active persistent sessions on the server and exit
+.TP
+\fB\-\-ping\fR \fI<PING>\fR [default: 0]
+Send N ping packets to measure round\-trip latency over QUIC (0 starts interactive terminal session)
+.TP
+\fB\-\-predict\fR \fI<MODE>\fR [default: auto]
+Predictive local echo mode: auto, always, or never
+.TP
+\fB\-\-predict\-style\fR \fI<STYLE>\fR [default: underline]
+Predictive local echo visual style: underline, dim, or none
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
+[\fIDESTINATION\fR]
+Remote destination in format [user@]host[:port]
+.TP
+[\fICOMMAND\fR]
+Optional command to execute on remote host
+.SH VERSION
+v0.1.0

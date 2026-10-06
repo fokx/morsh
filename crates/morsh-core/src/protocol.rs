@@ -123,6 +123,17 @@ pub enum ControlMessage {
         y_pixels: u16,
     },
 
+    /// Request to execute a remote command instead of an interactive login shell.
+    ExecRequest {
+        command: String,
+    },
+
+    /// Response acknowledging remote command execution request.
+    ExecResponse {
+        success: bool,
+        message: String,
+    },
+
     /// Client indicates that no interactive PTY shell should be allocated (-N / tunnel-only mode).
     NoShell,
 

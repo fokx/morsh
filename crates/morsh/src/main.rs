@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use morsh_auth::{
     find_first_default_private_key, load_private_key_file, sign_challenge, AgentClient,
 };
@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod config;
+use config::{ClientConfig, OpenSshOptions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,15 +33,51 @@ use tracing_subscriber::EnvFilter;
 struct Args {
     /// Remote destination in format [user@]host[:port]
     #[arg(value_name = "DESTINATION")]
-    destination: String,
+    destination: Option<String>,
 
-    /// Override remote port (defaults to 2222 or port from destination)
+    /// Optional command to execute on remote host
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    command: Vec<String>,
+
+    /// Override remote port (defaults to 2222 or port from destination / config)
     #[arg(short = 'p', long)]
     port: Option<u16>,
 
     /// Path to SSH private key file (e.g. ~/.ssh/id_ed25519)
     #[arg(short = 'i', long)]
     identity: Option<PathBuf>,
+
+    /// Path to alternative client configuration file (defaults to ~/.morsh/config.toml)
+    #[arg(short = 'F', long = "config", value_name = "CONFIG")]
+    config_file: Option<PathBuf>,
+
+    /// OpenSSH compatibility options in format Option=Value
+    #[arg(short = 'o', long = "option", value_name = "KEY=VALUE")]
+    options: Vec<String>,
+
+    /// Request stream compression
+    #[arg(short = 'C', long = "compress")]
+    compress: bool,
+
+    /// Force IPv4 address resolution only
+    #[arg(short = '4', long = "ipv4")]
+    ipv4: bool,
+
+    /// Force IPv6 address resolution only
+    #[arg(short = '6', long = "ipv6")]
+    ipv6: bool,
+
+    /// Increase verbosity level (-v: info, -vv: debug, -vvv: trace)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Generate shell completions for the specified shell (bash, zsh, fish) and exit
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<clap_complete::Shell>,
+
+    /// Generate man page (roff format) to stdout and exit
+    #[arg(long)]
+    man: bool,
 
     /// Password for password / PAM authentication
     #[arg(long)]
@@ -81,7 +119,7 @@ struct Args {
     #[arg(short = 'D', long = "dynamic-forward", value_name = "SPEC")]
     dynamic_forward: Vec<String>,
 
-    /// Native UDP port forwarding [bind_addr:]bind_port:target_host:target_port
+    /// Native UDP port forwarding [bind_addr:]bind_port:target_host:target_port (-U)
     #[arg(short = 'U', long = "udp-forward", value_name = "SPEC")]
     udp_forward: Vec<String>,
 
@@ -112,10 +150,6 @@ struct Args {
     /// Predictive local echo visual style: underline, dim, or none
     #[arg(long, default_value = "underline", value_name = "STYLE")]
     predict_style: String,
-
-    /// Enable verbose debug logging
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 struct ParsedDestination {
@@ -213,11 +247,24 @@ fn current_timestamp_ms() -> u64 {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let filter = if args.verbose {
-        EnvFilter::new("morsh=debug,morsh_transport=debug,morsh_auth=debug,quinn=info")
-    } else {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("morsh=info,morsh_transport=info,morsh_auth=info"))
+    if let Some(shell) = args.completions {
+        let mut cmd = Args::command();
+        clap_complete::generate(shell, &mut cmd, "morsh", &mut std::io::stdout());
+        return Ok(());
+    }
+
+    if args.man {
+        let cmd = Args::command();
+        let man = clap_mangen::Man::new(cmd);
+        man.render(&mut std::io::stdout())?;
+        return Ok(());
+    }
+
+    let filter = match args.verbose {
+        0 => EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("morsh=info,morsh_transport=info,morsh_auth=info")),
+        1 => EnvFilter::new("morsh=debug,morsh_transport=debug,morsh_auth=debug,quinn=info"),
+        _ => EnvFilter::new("morsh=trace,morsh_transport=trace,morsh_auth=trace,morsh_predict=trace,quinn=debug"),
     };
 
     tracing_subscriber::fmt()
@@ -225,13 +272,124 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let parsed = parse_destination(&args.destination, args.port)?;
-    let target = format!("{}:{}", parsed.host, parsed.port);
-    let sni_name = args.server_name.unwrap_or_else(|| parsed.host.clone());
+    let dest_str = match args.destination {
+        Some(ref d) => d.as_str(),
+        None => {
+            eprintln!("Error: Destination required: [user@]host[:port]");
+            eprintln!("Usage: morsh [OPTIONS] [DESTINATION] [COMMAND]...");
+            eprintln!("Try 'morsh --help' for more information.");
+            bail!("Missing destination argument");
+        }
+    };
+
+    // Load configuration files and OpenSSH options
+    let client_cfg = ClientConfig::load(args.config_file.as_deref())?;
+    let openssh_opts = OpenSshOptions::parse_options(&args.options)?;
+    let initial_parsed = parse_destination(dest_str, args.port)?;
+    let matched_rule = client_cfg.match_host(&initial_parsed.host);
+
+    let target_host = matched_rule.host_name.unwrap_or(initial_parsed.host);
+
+    let target_port = if let Some(p) = args.port {
+        p
+    } else if let Some(p) = openssh_opts.port {
+        p
+    } else if dest_str.contains(':') && initial_parsed.port != 2222 {
+        initial_parsed.port
+    } else if let Some(p) = matched_rule.port {
+        p
+    } else if let Some(p) = client_cfg.port {
+        p
+    } else {
+        initial_parsed.port
+    };
+
+    let target_user = if let Some(ref u) = initial_parsed.user {
+        Some(u.clone())
+    } else if let Some(ref u) = openssh_opts.user {
+        Some(u.clone())
+    } else if let Some(ref u) = matched_rule.user {
+        Some(u.clone())
+    } else if let Some(ref u) = client_cfg.user {
+        Some(u.clone())
+    } else {
+        std::env::var("USER").ok()
+    };
+
+    let target_identity = args.identity
+        .or(openssh_opts.identity_file)
+        .or(matched_rule.identity_file)
+        .or(client_cfg.identity_file);
+
+    let effective_insecure = args.insecure
+        || openssh_opts.strict_host_key_checking == Some(false)
+        || matched_rule.insecure.unwrap_or(false)
+        || client_cfg.insecure.unwrap_or(false);
+
+    let effective_no_agent = args.no_agent
+        || openssh_opts.forward_agent == Some(false)
+        || matched_rule.forward_agent == Some(false)
+        || client_cfg.forward_agent == Some(false);
+
+    let effective_stealth_knock = args.stealth_knock
+        .or(openssh_opts.stealth_knock)
+        .or(matched_rule.stealth_knock)
+        .or(client_cfg.stealth_knock);
+
+    let effective_force_tcp = args.force_tcp
+        || openssh_opts.force_tcp.unwrap_or(false)
+        || matched_rule.force_tcp.unwrap_or(false)
+        || client_cfg.force_tcp.unwrap_or(false);
+
+    let effective_tcp_timeout = if args.tcp_fallback_timeout != 300 {
+        args.tcp_fallback_timeout
+    } else {
+        openssh_opts.tcp_fallback_timeout
+            .or(matched_rule.tcp_fallback_timeout)
+            .or(client_cfg.tcp_fallback_timeout)
+            .unwrap_or(300)
+    };
+
+    let effective_predict = if args.predict != "auto" {
+        args.predict.clone()
+    } else {
+        openssh_opts.predict_mode
+            .or(matched_rule.predict_mode)
+            .or(client_cfg.predict_mode)
+            .unwrap_or_else(|| "auto".into())
+    };
+
+    let effective_predict_style = if args.predict_style != "underline" {
+        args.predict_style.clone()
+    } else {
+        openssh_opts.predict_style
+            .or(matched_rule.predict_style)
+            .or(client_cfg.predict_style)
+            .unwrap_or_else(|| "underline".into())
+    };
+
+    let mut all_local_forwards = args.local_forward.clone();
+    all_local_forwards.extend(openssh_opts.local_forward);
+    all_local_forwards.extend(matched_rule.local_forward);
+
+    let mut all_remote_forwards = args.remote_forward.clone();
+    all_remote_forwards.extend(openssh_opts.remote_forward);
+    all_remote_forwards.extend(matched_rule.remote_forward);
+
+    let mut all_dynamic_forwards = args.dynamic_forward.clone();
+    all_dynamic_forwards.extend(openssh_opts.dynamic_forward);
+    all_dynamic_forwards.extend(matched_rule.dynamic_forward);
+
+    let mut all_udp_forwards = args.udp_forward.clone();
+    all_udp_forwards.extend(openssh_opts.udp_forward);
+    all_udp_forwards.extend(matched_rule.udp_forward);
+
+    let target = format!("{}:{}", target_host, target_port);
+    let sni_name = args.server_name.unwrap_or_else(|| target_host.clone());
 
     info!(
         destination = %target,
-        user = ?parsed.user,
+        user = ?target_user,
         sni = %sni_name,
         "Resolving server address"
     );
@@ -240,11 +398,18 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("Failed to resolve destination '{}'", target))?;
 
-    let remote_addr: SocketAddr = addrs
-        .next()
-        .with_context(|| format!("Could not find any IP address for '{}'", target))?;
+    let remote_addr: SocketAddr = if args.ipv4 {
+        addrs.find(|a| a.is_ipv4())
+            .with_context(|| format!("No IPv4 address found for '{}'", target))?
+    } else if args.ipv6 {
+        addrs.find(|a| a.is_ipv6())
+            .with_context(|| format!("No IPv6 address found for '{}'", target))?
+    } else {
+        addrs.next()
+            .with_context(|| format!("Could not find any IP address for '{}'", target))?
+    };
 
-    let rustls_client_config = make_rustls_client_config(args.insecure)
+    let rustls_client_config = make_rustls_client_config(effective_insecure)
         .context("Failed to initialize client TLS transport configuration")?;
     let quic_client_config = make_client_config_from_rustls(rustls_client_config.clone())
         .context("Failed to initialize QUIC client transport configuration")?;
@@ -252,7 +417,7 @@ async fn main() -> Result<()> {
     let client = QuicClient::new(quic_client_config)
         .context("Failed to bind client endpoint")?;
 
-    let fallback_delay = Duration::from_millis(args.tcp_fallback_timeout);
+    let fallback_delay = Duration::from_millis(effective_tcp_timeout);
 
     let conn_start = Instant::now();
     let conn = connect_happy_eyeballs(
@@ -261,7 +426,7 @@ async fn main() -> Result<()> {
         &client,
         rustls_client_config,
         fallback_delay,
-        args.force_tcp,
+        effective_force_tcp,
     )
     .await
     .context("Failed to establish connection with morsh server")?;
@@ -290,7 +455,7 @@ async fn main() -> Result<()> {
     let client_hello = ControlMessage::ClientHello {
         version: PROTOCOL_VERSION,
         client_software: format!("morsh-{}", env!("CARGO_PKG_VERSION")),
-        knock_path: args.stealth_knock.clone(),
+        knock_path: effective_stealth_knock.clone(),
         resumption_session_id: resume_session_id,
     };
 
@@ -336,7 +501,7 @@ async fn main() -> Result<()> {
 
     // Phase 2: Perform Authentication if required by server
     let requires_auth = !(supported_auth.len() == 1 && supported_auth[0] == AuthMethod::None
-        && args.identity.is_none() && args.password.is_none());
+        && target_identity.is_none() && args.password.is_none());
 
     if requires_auth {
         debug!("Waiting for AuthChallenge frame from server...");
@@ -352,20 +517,20 @@ async fn main() -> Result<()> {
             other => bail!("Expected AuthChallenge, got {:?}", other),
         };
 
-        let username = parsed.user.clone().unwrap_or_else(|| {
+        let username = target_user.unwrap_or_else(|| {
             std::env::var("USER").unwrap_or_else(|_| "root".into())
         });
 
         info!(username = %username, "Authenticating with server...");
 
         // Select credentials
-        let auth_req = if let Some(ref key_path) = args.identity {
+        let auth_req = if let Some(ref key_path) = target_identity {
             info!(path = %key_path.display(), "Using specified SSH private key");
             let sk = load_private_key_file(key_path, None)?;
             let (algorithm, public_key, signature) =
                 sign_challenge(&sk, &session_id, &challenge, &username)?;
             AuthRequest::PublicKey { username, algorithm, public_key, signature }
-        } else if !args.no_agent && AgentClient::is_available() {
+        } else if !effective_no_agent && AgentClient::is_available() {
             info!("Querying ssh-agent for credentials...");
             match AgentClient::connect_env() {
                 Ok(mut agent) => {
@@ -443,7 +608,7 @@ async fn main() -> Result<()> {
     }
 
     // Cache session token for future resumption
-    save_session_token(&session_id, &resumption_token, &args.destination);
+    save_session_token(&session_id, &resumption_token, dest_str);
 
     // If client requested --list-sessions, query server and exit immediately
     if args.list_sessions {
@@ -453,7 +618,7 @@ async fn main() -> Result<()> {
         match resp {
             ControlMessage::SessionListResponse { sessions } => {
                 println!();
-                println!("Active persistent sessions on {}:", args.destination);
+                println!("Active persistent sessions on {}:", dest_str);
                 if sessions.is_empty() {
                     println!("  No active persistent sessions.");
                 } else {
@@ -524,7 +689,7 @@ async fn main() -> Result<()> {
     }
 
     use std::io::IsTerminal;
-    let is_tty = std::io::stdin().is_terminal();
+    let is_tty = std::io::stdin().is_terminal() && args.command.is_empty();
 
     // Channel for asynchronous control frame transmissions over Stream 0
     let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<ControlMessage>(64);
@@ -533,8 +698,13 @@ async fn main() -> Result<()> {
     let mut send_stream = send;
     let ctrl_write_task = tokio::spawn(async move {
         while let Some(msg) = ctrl_rx.recv().await {
+            let is_disconnect = matches!(msg, ControlMessage::Disconnect { .. });
             if let Err(e) = MorshConnection::send_control_message(&mut send_stream, &msg).await {
                 debug!(error = %e, "Outbound control stream closed");
+                break;
+            }
+            if is_disconnect {
+                debug!("Outbound Disconnect sent; exiting control write loop");
                 break;
             }
         }
@@ -583,7 +753,7 @@ async fn main() -> Result<()> {
     }
 
     // Launch configured tunnels
-    for spec in &args.local_forward {
+    for spec in &all_local_forwards {
         let rule = ForwardRule::parse(spec)?;
         let c = conn.clone();
         let tm = tunnel_manager.clone();
@@ -594,7 +764,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    for spec in &args.dynamic_forward {
+    for spec in &all_dynamic_forwards {
         let rule = DynamicRule::parse(spec)?;
         let c = conn.clone();
         let tm = tunnel_manager.clone();
@@ -605,12 +775,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    for spec in &args.remote_forward {
+    for spec in &all_remote_forwards {
         let rule = ForwardRule::parse(spec)?;
         request_remote_forward(&rule, &tunnel_manager).await?;
     }
 
-    for spec in &args.udp_forward {
+    for spec in &all_udp_forwards {
         let rule = UdpRule::parse(spec)?;
         let c = conn.clone();
         let tm = tunnel_manager.clone();
@@ -688,6 +858,26 @@ async fn main() -> Result<()> {
         };
         let _ = ctrl_tx.send(resize_msg).await;
 
+        if !args.command.is_empty() {
+            let cmd_str = args.command.join(" ");
+            debug!(command = %cmd_str, "Sending ExecRequest to server");
+            let exec_req = ControlMessage::ExecRequest { command: cmd_str };
+            let _ = ctrl_tx.send(exec_req).await;
+
+            // Wait for server to acknowledge ExecRequest so that command is set before Stream 1 is accepted
+            match MorshConnection::read_control_message(&mut recv).await? {
+                ControlMessage::ExecResponse { success, message } => {
+                    if !success {
+                        bail!("Failed to execute command on server: {}", message);
+                    }
+                    debug!("Server acknowledged ExecRequest: {}", message);
+                }
+                other => {
+                    debug!("Received control frame while awaiting ExecResponse: {:?}", other);
+                }
+            }
+        }
+
         // Open Stream 1 for raw bidirectional PTY byte streaming
         let (mut pty_send, mut pty_recv) = conn
             .open_bi()
@@ -719,8 +909,8 @@ async fn main() -> Result<()> {
         let mut saw_detach_prefix = false;
         let mut detached_by_user = false;
 
-        let predict_mode = args.predict.parse::<morsh_predict::PredictMode>().unwrap_or_default();
-        let predict_style = args.predict_style.parse::<morsh_predict::PredictStyle>().unwrap_or_default();
+        let predict_mode = effective_predict.parse::<morsh_predict::PredictMode>().unwrap_or_default();
+        let predict_style = effective_predict_style.parse::<morsh_predict::PredictStyle>().unwrap_or_default();
         let mut predict_engine = morsh_predict::PredictionEngine::new(predict_mode, predict_style);
 
         loop {
@@ -849,7 +1039,7 @@ async fn main() -> Result<()> {
             stream_accept_task.abort();
             datagram_task.abort();
             println!("\r\n[morsh: detached session {}]", hex_encode(&session_id));
-            println!("[To resume, run: morsh {} --resume {}]\r\n", args.destination, hex_encode(&session_id));
+            println!("[To resume, run: morsh {} --resume {}]\r\n", dest_str, hex_encode(&session_id));
             drop(ctrl_tx);
             conn.close(0, "session detached");
             return Ok(());
@@ -866,8 +1056,9 @@ async fn main() -> Result<()> {
         message: "client finished".into(),
     };
     let _ = ctrl_tx.send(disconnect).await;
+    drop(tunnel_manager);
     drop(ctrl_tx);
-    let _ = ctrl_write_task.await;
+    let _ = tokio::time::timeout(Duration::from_millis(500), ctrl_write_task).await;
 
     conn.close(0, "normal client exit");
     if !is_tty && args.ping > 0 {
@@ -1028,5 +1219,31 @@ mod tests {
         assert!(parse_destination("@", None).is_err());
         assert!(parse_destination("[::1", None).is_err()); // Unclosed bracket
         assert!(parse_destination("host:notaport", None).is_err());
+    }
+
+    #[test]
+    fn test_args_parsing_openssh_flags() {
+        let args = Args::try_parse_from([
+            "morsh",
+            "-p", "2222",
+            "-i", "/tmp/id_test",
+            "-C",
+            "-4",
+            "-vv",
+            "-o", "User=alice",
+            "-o", "StrictHostKeyChecking=no",
+            "srv.example.com",
+            "ls", "-la",
+        ]).unwrap();
+
+        assert_eq!(args.destination, Some("srv.example.com".into()));
+        assert_eq!(args.port, Some(2222));
+        assert_eq!(args.identity, Some(PathBuf::from("/tmp/id_test")));
+        assert!(args.compress);
+        assert!(args.ipv4);
+        assert!(!args.ipv6);
+        assert_eq!(args.verbose, 2);
+        assert_eq!(args.options.len(), 2);
+        assert_eq!(args.command, vec!["ls".to_string(), "-la".to_string()]);
     }
 }

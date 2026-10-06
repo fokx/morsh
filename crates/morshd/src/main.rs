@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use morsh_auth::{generate_challenge, AuthorizedKeys, PamAuthenticator, PasswordVerifier};
 use morsh_core::protocol::{
     AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PROTOCOL_VERSION,
@@ -23,6 +23,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod config;
+use config::ServerConfig;
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "morshd",
@@ -30,13 +33,25 @@ use tracing_subscriber::EnvFilter;
     about = "morshd - Next-generation resilient QUIC SSH daemon (combining Mosh & SSH3)"
 )]
 struct Args {
-    /// Socket address to listen on for incoming UDP/QUIC traffic
-    #[arg(short, long, default_value = "0.0.0.0:2222")]
-    listen: String,
+    /// Socket address to listen on for incoming UDP/QUIC traffic (default: 0.0.0.0:2222)
+    #[arg(short, long)]
+    listen: Option<String>,
 
     /// Optional explicit socket address to listen on for TCP fallback (defaults to same port as --listen)
     #[arg(long)]
     tcp_listen: Option<String>,
+
+    /// Optional path to server TOML configuration file (defaults to /etc/morsh/morshd.toml)
+    #[arg(short = 'C', short_alias = 'f', long = "config", value_name = "CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Generate shell completions for the specified shell (bash, zsh, fish) and exit
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<clap_complete::Shell>,
+
+    /// Generate man page (roff format) to stdout and exit
+    #[arg(long)]
+    man: bool,
 
     /// Optional path to TLS certificate chain in PEM format
     #[arg(short = 'c', long)]
@@ -58,9 +73,9 @@ struct Args {
     #[arg(long)]
     allow_password: bool,
 
-    /// PAM service name to use for password authentication
-    #[arg(long, default_value = "morsh")]
-    pam_service: String,
+    /// PAM service name to use for password authentication (default: morsh)
+    #[arg(long)]
+    pam_service: Option<String>,
 
     /// Permit unauthenticated connections (testing / development only)
     #[arg(long)]
@@ -71,7 +86,7 @@ struct Args {
     verbose: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ServerAuthOptions {
     stealth_knock: Option<String>,
     auth_keys: Option<PathBuf>,
@@ -106,9 +121,10 @@ fn load_certs_and_key(
 
 async fn handle_connection(
     conn: MorshConnection,
-    opts: Arc<ServerAuthOptions>,
+    opts_lock: Arc<tokio::sync::RwLock<ServerAuthOptions>>,
     session_registry: SessionRegistry,
 ) -> Result<()> {
+    let opts = opts_lock.read().await.clone();
     let peer_addr = conn.remote_address();
     info!(peer = %peer_addr, "Handling new client connection");
 
@@ -385,6 +401,8 @@ async fn handle_connection(
         Arc::new(tokio::sync::Mutex::new((80, 24)));
     let initial_term: Arc<tokio::sync::Mutex<String>> =
         Arc::new(tokio::sync::Mutex::new("xterm-256color".into()));
+    let initial_command: Arc<tokio::sync::Mutex<Option<Vec<String>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
     let (pty_shutdown_tx, mut pty_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let pty_shutdown_tx_opt = Arc::new(tokio::sync::Mutex::new(Some(pty_shutdown_tx)));
@@ -392,6 +410,7 @@ async fn handle_connection(
     let session_registry_for_stream = session_registry.clone();
     let initial_dims_for_accept = Arc::clone(&initial_dims);
     let initial_term_for_accept = Arc::clone(&initial_term);
+    let initial_command_for_accept = Arc::clone(&initial_command);
     let auth_user_clone = authenticated_user.clone();
 
     // Channel for asynchronous control frame transmissions back to client
@@ -422,10 +441,12 @@ async fn handle_connection(
                     None => {
                         let (cols, rows) = *initial_dims_for_accept.lock().await;
                         let term = initial_term_for_accept.lock().await.clone();
+                        let command = initial_command_for_accept.lock().await.clone();
                         let mut cfg = PtyConfig {
                             cols,
                             rows,
                             term,
+                            command,
                             ..Default::default()
                         };
                         if auth_user_clone != "unauthenticated" {
@@ -574,6 +595,15 @@ async fn handle_connection(
                         if let Some(ref session) = *active_session.lock().await {
                             let _ = session.resize(cols, rows);
                         }
+                    }
+                    Ok(ControlMessage::ExecRequest { command }) => {
+                        debug!(peer = %peer_addr, %command, "Client requested remote command execution");
+                        *initial_command.lock().await = Some(vec!["/bin/sh".to_string(), "-c".to_string(), command]);
+                        let resp = ControlMessage::ExecResponse {
+                            success: true,
+                            message: "Command execution scheduled".into(),
+                        };
+                        let _ = ctrl_tx.send(resp).await;
                     }
                     Ok(ControlMessage::SessionDetachRequest) => {
                         info!(peer = %peer_addr, session = %session_hex, "Client requested voluntary session detach");
@@ -767,7 +797,33 @@ fn hex_encode(bytes: &[u8]) -> String {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let filter = if args.verbose {
+    if let Some(shell) = args.completions {
+        let mut cmd = Args::command();
+        clap_complete::generate(shell, &mut cmd, "morshd", &mut std::io::stdout());
+        return Ok(());
+    }
+
+    if args.man {
+        let cmd = Args::command();
+        let man = clap_mangen::Man::new(cmd).section("8");
+        man.render(&mut std::io::stdout())?;
+        return Ok(());
+    }
+
+    let (server_cfg, loaded_config_path) = ServerConfig::load(args.config.as_deref())?;
+
+    let effective_verbose = args.verbose || server_cfg.verbose.unwrap_or(false);
+    let effective_listen = args.listen.or(server_cfg.listen).unwrap_or_else(|| "0.0.0.0:2222".into());
+    let effective_tcp_listen = args.tcp_listen.or(server_cfg.tcp_listen);
+    let effective_cert = args.cert.or(server_cfg.cert);
+    let effective_key = args.key.or(server_cfg.key);
+    let effective_stealth_knock = args.stealth_knock.or(server_cfg.stealth_knock);
+    let effective_auth_keys = args.auth_keys.or(server_cfg.auth_keys);
+    let effective_allow_password = args.allow_password || server_cfg.allow_password.unwrap_or(false);
+    let effective_pam_service = args.pam_service.or(server_cfg.pam_service).unwrap_or_else(|| "morsh".into());
+    let effective_no_auth = args.no_auth || server_cfg.no_auth.unwrap_or(false);
+
+    let filter = if effective_verbose {
         EnvFilter::new("morsh=debug,morshd=debug,morsh_transport=debug,morsh_auth=debug,quinn=info")
     } else {
         EnvFilter::try_from_default_env()
@@ -780,8 +836,11 @@ async fn main() -> Result<()> {
         .init();
 
     info!("=== morshd v{} ===", env!("CARGO_PKG_VERSION"));
+    if let Some(ref path) = loaded_config_path {
+        info!("Loaded server configuration from {:?}", path);
+    }
 
-    let (certs, key) = load_certs_and_key(args.cert.as_ref(), args.key.as_ref())?;
+    let (certs, key) = load_certs_and_key(effective_cert.as_ref(), effective_key.as_ref())?;
 
     if let Some(first_cert) = certs.first() {
         let fingerprint = cert_fingerprint_sha256(first_cert);
@@ -793,12 +852,11 @@ async fn main() -> Result<()> {
     let quic_server_config = make_server_config_from_rustls(server_rustls.clone())
         .context("Failed to construct server QUIC transport configuration")?;
 
-    let listen_addr: SocketAddr = args
-        .listen
+    let listen_addr: SocketAddr = effective_listen
         .parse()
-        .with_context(|| format!("Invalid listen address: {}", args.listen))?;
+        .with_context(|| format!("Invalid listen address: {}", effective_listen))?;
 
-    let tcp_listen_str = args.tcp_listen.as_deref().unwrap_or(&args.listen);
+    let tcp_listen_str = effective_tcp_listen.as_deref().unwrap_or(&effective_listen);
     let tcp_listen_addr: SocketAddr = tcp_listen_str
         .parse()
         .with_context(|| format!("Invalid TCP fallback listen address: {}", tcp_listen_str))?;
@@ -813,28 +871,28 @@ async fn main() -> Result<()> {
     let local_tcp_addr = tcp_server.local_addr()?;
     info!("morshd listening on quic://{}", local_quic_addr);
     info!("morshd listening on tcp://{} (TLS 1.3 fallback)", local_tcp_addr);
-    if let Some(ref knock) = args.stealth_knock {
+    if let Some(ref knock) = effective_stealth_knock {
         info!("Stealth knock enabled: requires path '{}'", knock);
     }
-    if args.no_auth {
+    if effective_no_auth {
         warn!("SECURITY NOTICE: morshd running with --no-auth (unauthenticated login permitted)");
     } else {
         info!("Authentication required: SSH public keys accepted (Ed25519, RSA, ECDSA)");
-        if args.allow_password {
-            info!("Password / PAM authentication enabled (service: '{}')", args.pam_service);
+        if effective_allow_password {
+            info!("Password / PAM authentication enabled (service: '{}')", effective_pam_service);
         }
-        if let Some(ref ak) = args.auth_keys {
+        if let Some(ref ak) = effective_auth_keys {
             info!("Authorized keys file override: {}", ak.display());
         }
     }
 
-    let auth_opts = Arc::new(ServerAuthOptions {
-        stealth_knock: args.stealth_knock.clone(),
-        auth_keys: args.auth_keys.clone(),
-        allow_password: args.allow_password,
-        pam_service: args.pam_service.clone(),
-        no_auth: args.no_auth,
-    });
+    let auth_opts = Arc::new(tokio::sync::RwLock::new(ServerAuthOptions {
+        stealth_knock: effective_stealth_knock.clone(),
+        auth_keys: effective_auth_keys.clone(),
+        allow_password: effective_allow_password,
+        pam_service: effective_pam_service.clone(),
+        no_auth: effective_no_auth,
+    }));
 
     let session_registry = SessionRegistry::new();
     let reaper_registry = session_registry.clone();
@@ -846,12 +904,70 @@ async fn main() -> Result<()> {
         }
     });
 
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("Failed to register SIGHUP listener")?;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("Failed to register SIGTERM listener")?;
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received; shutting down morshd gracefully");
+                info!("Ctrl+C (SIGINT) received; shutting down morshd gracefully");
                 quic_server.close(0, b"daemon shutdown");
                 break;
+            }
+            _ = async {
+                #[cfg(unix)]
+                { sigterm.recv().await }
+                #[cfg(not(unix))]
+                { std::future::pending::<Option<()>>().await }
+            } => {
+                info!("SIGTERM received; shutting down morshd gracefully");
+                quic_server.close(0, b"daemon shutdown");
+                break;
+            }
+            _ = async {
+                #[cfg(unix)]
+                { sighup.recv().await }
+                #[cfg(not(unix))]
+                { std::future::pending::<Option<()>>().await }
+            } => {
+                info!("SIGHUP received; checking configuration reload");
+                if let Some(ref path) = loaded_config_path {
+                    match ServerConfig::load(Some(path)) {
+                        Ok((reloaded_cfg, _)) => {
+                            let mut w = auth_opts.write().await;
+                            if let Some(sk) = reloaded_cfg.stealth_knock {
+                                info!(knock = %sk, "Reloaded stealth knock configuration");
+                                w.stealth_knock = Some(sk);
+                            }
+                            if let Some(ak) = reloaded_cfg.auth_keys {
+                                info!(keys = %ak.display(), "Reloaded authorized keys configuration");
+                                w.auth_keys = Some(ak);
+                            }
+                            if let Some(ap) = reloaded_cfg.allow_password {
+                                info!(allow_password = ap, "Reloaded allow_password configuration");
+                                w.allow_password = ap;
+                            }
+                            if let Some(ps) = reloaded_cfg.pam_service {
+                                info!(pam_service = %ps, "Reloaded PAM service configuration");
+                                w.pam_service = ps;
+                            }
+                            if let Some(na) = reloaded_cfg.no_auth {
+                                info!(no_auth = na, "Reloaded no_auth configuration");
+                                w.no_auth = na;
+                            }
+                            info!("SIGHUP: Successfully reloaded configuration from {:?}", path);
+                        }
+                        Err(e) => {
+                            warn!("SIGHUP: Failed to reload configuration: {:#}", e);
+                        }
+                    }
+                } else {
+                    info!("SIGHUP received but no configuration file was loaded at startup");
+                }
             }
             conn_res = quic_server.accept() => {
                 match conn_res {
@@ -897,4 +1013,37 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_args_parsing_defaults() {
+        let args = Args::try_parse_from(["morshd"]).unwrap();
+        assert_eq!(args.listen, None);
+        assert!(!args.allow_password);
+        assert!(!args.no_auth);
+    }
+
+    #[test]
+    fn test_args_parsing_custom_flags() {
+        let args = Args::try_parse_from([
+            "morshd",
+            "--listen", "127.0.0.1:4433",
+            "--tcp-listen", "127.0.0.1:4434",
+            "--config", "/tmp/morshd.toml",
+            "--stealth-knock", "/secret",
+            "--allow-password",
+            "-v",
+        ]).unwrap();
+
+        assert_eq!(args.listen.as_deref(), Some("127.0.0.1:4433"));
+        assert_eq!(args.tcp_listen.as_deref(), Some("127.0.0.1:4434"));
+        assert_eq!(args.config, Some(PathBuf::from("/tmp/morshd.toml")));
+        assert_eq!(args.stealth_knock.as_deref(), Some("/secret"));
+        assert!(args.allow_password);
+        assert!(args.verbose);
+    }
 }

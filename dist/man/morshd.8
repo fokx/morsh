@@ -1,0 +1,73 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH morshd 8  "morshd 0.1.0" 
+.SH NAME
+morshd \- morshd \- Next\-generation resilient QUIC SSH daemon (combining Mosh & SSH3)
+.SH SYNOPSIS
+\fBmorshd\fR [\fB\-l\fR|\fB\-\-listen\fR] [\fB\-\-tcp\-listen\fR] [\fB\-C\fR|\fB\-\-config\fR] [\fB\-\-completions\fR] [\fB\-\-man\fR] [\fB\-c\fR|\fB\-\-cert\fR] [\fB\-k\fR|\fB\-\-key\fR] [\fB\-\-stealth\-knock\fR] [\fB\-\-auth\-keys\fR] [\fB\-\-allow\-password\fR] [\fB\-\-pam\-service\fR] [\fB\-\-no\-auth\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] 
+.SH DESCRIPTION
+morshd \- Next\-generation resilient QUIC SSH daemon (combining Mosh & SSH3)
+.SH OPTIONS
+.TP
+\fB\-l\fR, \fB\-\-listen\fR \fI<LISTEN>\fR
+Socket address to listen on for incoming UDP/QUIC traffic (default: 0.0.0.0:2222)
+.TP
+\fB\-\-tcp\-listen\fR \fI<TCP_LISTEN>\fR
+Optional explicit socket address to listen on for TCP fallback (defaults to same port as \-\-listen)
+.TP
+\fB\-C\fR, \fB\-\-config\fR \fI<CONFIG>\fR
+Optional path to server TOML configuration file (defaults to /etc/morsh/morshd.toml)
+.TP
+\fB\-\-completions\fR \fI<SHELL>\fR
+Generate shell completions for the specified shell (bash, zsh, fish) and exit
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+bash
+.IP \(bu 2
+elvish
+.IP \(bu 2
+fish
+.IP \(bu 2
+powershell
+.IP \(bu 2
+zsh
+.RE
+.TP
+\fB\-\-man\fR
+Generate man page (roff format) to stdout and exit
+.TP
+\fB\-c\fR, \fB\-\-cert\fR \fI<CERT>\fR
+Optional path to TLS certificate chain in PEM format
+.TP
+\fB\-k\fR, \fB\-\-key\fR \fI<KEY>\fR
+Optional path to TLS private key in PEM format (PKCS#8)
+.TP
+\fB\-\-stealth\-knock\fR \fI<STEALTH_KNOCK>\fR
+Optional stealth knock path prefix (SSH3 style anti\-scanning defense)
+.TP
+\fB\-\-auth\-keys\fR \fI<AUTH_KEYS>\fR
+Optional explicit path to authorized_keys file (defaults to ~/.ssh/authorized_keys per user)
+.TP
+\fB\-\-allow\-password\fR
+Allow Linux PAM / password authentication
+.TP
+\fB\-\-pam\-service\fR \fI<PAM_SERVICE>\fR
+PAM service name to use for password authentication (default: morsh)
+.TP
+\fB\-\-no\-auth\fR
+Permit unauthenticated connections (testing / development only)
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose debug logging
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH VERSION
+v0.1.0

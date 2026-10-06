@@ -19,7 +19,11 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
 

@@ -1,0 +1,31 @@
+[Unit]
+Description=morsh next-generation resilient SSH daemon
+Documentation=man:morshd(8) https://github.com/morsh/morsh
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/morshd --config /etc/morsh/morshd.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5s
+
+# Security Sandboxing & Hardening
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_CHROOT CAP_AUDIT_WRITE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=no
+
+# Resource Limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

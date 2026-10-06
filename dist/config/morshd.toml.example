@@ -1,0 +1,33 @@
+# morshd Server Daemon Configuration File Template
+# Copy to /etc/morsh/morshd.toml or reference via morshd -C /path/to/morshd.toml
+
+# Socket address to listen on for incoming UDP/QUIC traffic (default: 0.0.0.0:2222)
+listen = "0.0.0.0:2222"
+
+# Socket address to listen on for TLS 1.3 over TCP fallback (defaults to same port as listen)
+# tcp_listen = "0.0.0.0:2222"
+
+# Path to TLS certificate chain in PEM format (ephemeral self-signed if omitted)
+# cert = "/etc/morsh/server.crt"
+
+# Path to TLS private key in PEM format (PKCS#8)
+# key = "/etc/morsh/server.key"
+
+# Secret stealth knock path prefix (SSH3 style anti-scanning defense)
+# Unauthorized probes without this path are dropped silently with HTTP 404
+# stealth_knock = "/stealth-secret-knock"
+
+# Explicit path to authorized_keys file (defaults to ~/.ssh/authorized_keys per user)
+# auth_keys = "/etc/morsh/authorized_keys"
+
+# Allow Linux PAM / password authentication
+allow_password = false
+
+# Linux PAM service name to use for password authentication (default: "morsh")
+pam_service = "morsh"
+
+# Permit unauthenticated connections (testing / development only)
+no_auth = false
+
+# Enable verbose debug logging
+verbose = false

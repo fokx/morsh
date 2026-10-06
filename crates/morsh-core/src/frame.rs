@@ -153,7 +153,11 @@ mod tests {
             y_pixels: 0,
         };
 
-        for msg in [resize, pty_req] {
+        let exec_req = ControlMessage::ExecRequest {
+            command: "uname -a".into(),
+        };
+
+        for msg in [resize, pty_req, exec_req] {
             let mut buffer = Vec::new();
             write_frame(&mut buffer, &msg).await.unwrap();
             let mut reader = Cursor::new(buffer);
@@ -365,6 +369,25 @@ mod tests {
         };
 
         for msg in [input_seq, ack] {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &msg).await.unwrap();
+            let mut reader = Cursor::new(buffer);
+            let decoded: ControlMessage = read_frame(&mut reader).await.unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_frames_roundtrip() {
+        let req = ControlMessage::ExecRequest {
+            command: "echo hello".to_string(),
+        };
+        let resp = ControlMessage::ExecResponse {
+            success: true,
+            message: "OK".to_string(),
+        };
+
+        for msg in [req, resp] {
             let mut buffer = Vec::new();
             write_frame(&mut buffer, &msg).await.unwrap();
             let mut reader = Cursor::new(buffer);
