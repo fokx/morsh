@@ -353,9 +353,9 @@ impl OpenSshOptions {
                 }
                 "stricthostkeychecking" => {
                     let mode = match val.to_lowercase().as_str() {
-                        "no" | "off" => StrictHostKeyCheckingMode::No,
+                        "no" | "off" | "false" => StrictHostKeyCheckingMode::No,
                         "accept-new" => StrictHostKeyCheckingMode::AcceptNew,
-                        "yes" => StrictHostKeyCheckingMode::Yes,
+                        "yes" | "on" | "true" => StrictHostKeyCheckingMode::Yes,
                         "ask" => StrictHostKeyCheckingMode::Ask,
                         _ => {
                             tracing::warn!("Unknown StrictHostKeyChecking value: '{}', defaulting to ask", val);

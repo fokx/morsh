@@ -815,3 +815,18 @@ For future operational maintenance, release engineering, and platform extensions
     - `test_authenticated_user_session_execution`: end-to-end integration test verifying Ed25519 public key authentication and command execution in user session.
   - Test suite status: All 132 tests passing workspace-wide with 0 warnings.
 
+### 2026-10-07 — Persistent Host Certificate & Key Across Restarts
+- Fixed issue where `morshd` generated a new ephemeral certificate on every restart, causing clients to trigger `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!`.
+- Root Cause:
+  - Without explicit `--cert`/`--key` flags, `morshd` generated an ephemeral in-memory certificate on the fly using `rcgen`.
+  - When `morshd` restarted, its SHA-256 host fingerprint changed, causing `morsh` to fail host key verification against `~/.morsh/known_hosts`.
+- Resolution & Architectural Enhancements:
+  - Added `generate_self_signed_cert_pem` in `crates/morsh-transport/src/tls.rs` returning PEM-encoded certificate and private key.
+  - Implemented persistent host key discovery & auto-generation in `crates/morshd/src/main.rs`:
+    - Checks default host key paths: `/etc/morsh/host_cert.pem` & `/etc/morsh/host_key.pem` (when root), or `~/.morsh/host_cert.pem` & `~/.morsh/host_key.pem` (when non-root).
+    - If present, loads them on startup, preserving the server's identity across restarts.
+    - If not present, generates a new self-signed certificate and key in PEM format and persists them with `0600` permissions.
+    - Falls back gracefully to in-memory ephemeral certificates if disk write permissions are not available.
+  - Added support for `StrictHostKeyChecking=false`, `no`, `off` and `true`, `on`, `yes` in `crates/morsh/src/config.rs`.
+
+

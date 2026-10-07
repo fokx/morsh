@@ -25,6 +25,25 @@ pub fn generate_self_signed_cert(
     Ok((vec![cert_der], key_der))
 }
 
+/// Generates a self-signed X.509 certificate and private key in PEM format.
+pub fn generate_self_signed_cert_pem(
+    subject_alt_names: Vec<String>,
+) -> Result<(String, String)> {
+    let subject_names = if subject_alt_names.is_empty() {
+        vec!["localhost".to_string(), "0.0.0.0".to_string(), "127.0.0.1".to_string()]
+    } else {
+        subject_alt_names
+    };
+
+    let certified_key = rcgen::generate_simple_self_signed(subject_names)
+        .context("Failed to generate self-signed certificate")?;
+
+    let cert_pem = certified_key.cert.pem();
+    let key_pem = certified_key.signing_key.serialize_pem();
+
+    Ok((cert_pem, key_pem))
+}
+
 /// Computes the SHA-256 fingerprint of a certificate for TOFU / host verification.
 pub fn cert_fingerprint_sha256(cert: &CertificateDer) -> String {
     use ring::digest::{digest, SHA256};

@@ -1242,6 +1242,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "libc",
  "morsh-auth",
  "morsh-core",
  "morsh-term",

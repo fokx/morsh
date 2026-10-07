@@ -20,10 +20,10 @@ pub use stream::{MorshRecvStream, MorshSendStream, MorshStreamId};
 pub use tcp::{TcpClient, TcpServer};
 pub use tcp_mux::TcpConnection;
 pub use tls::{
-    cert_fingerprint_sha256, generate_self_signed_cert, make_client_config,
-    make_client_config_from_rustls, make_rustls_client_config, make_rustls_server_config,
-    make_server_config, make_server_config_from_rustls, make_tofu_rustls_client_config,
-    SkipServerVerification, TofuOptions,
+    cert_fingerprint_sha256, generate_self_signed_cert, generate_self_signed_cert_pem,
+    make_client_config, make_client_config_from_rustls, make_rustls_client_config,
+    make_rustls_server_config, make_server_config, make_server_config_from_rustls,
+    make_tofu_rustls_client_config, SkipServerVerification, TofuOptions,
 };
 
 #[cfg(test)]

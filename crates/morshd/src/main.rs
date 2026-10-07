@@ -6,7 +6,7 @@ use morsh_core::protocol::{
 };
 use morsh_term::{PersistentSession, PtyConfig, SessionRegistry};
 use morsh_transport::{
-    cert_fingerprint_sha256, generate_self_signed_cert, generate_session_id,
+    cert_fingerprint_sha256, generate_self_signed_cert_pem, generate_session_id,
     make_rustls_server_config, make_server_config_from_rustls, MorshConnection, QuicServer,
     TcpServer,
 };
@@ -95,28 +95,129 @@ struct ServerAuthOptions {
     no_auth: bool,
 }
 
+fn default_host_cert_and_key_paths() -> (PathBuf, PathBuf) {
+    #[cfg(unix)]
+    let is_root = unsafe { libc::geteuid() == 0 };
+    #[cfg(not(unix))]
+    let is_root = false;
+
+    if is_root {
+        (
+            PathBuf::from("/etc/morsh/host_cert.pem"),
+            PathBuf::from("/etc/morsh/host_key.pem"),
+        )
+    } else if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(home).join(".morsh");
+        (dir.join("host_cert.pem"), dir.join("host_key.pem"))
+    } else {
+        (
+            PathBuf::from("host_cert.pem"),
+            PathBuf::from("host_key.pem"),
+        )
+    }
+}
+
+fn load_pem_cert_and_key_files(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let cert_file = File::open(cert_path).with_context(|| format!("Failed to open cert file {:?}", cert_path))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to parse TLS certificates")?;
+
+    let key_file = File::open(key_path).with_context(|| format!("Failed to open key file {:?}", key_path))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("Failed to parse TLS private key")?
+        .context("No private key found in key file")?;
+
+    Ok((certs, key))
+}
+
+fn parse_pem_cert_and_key(
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    let mut cert_reader = std::io::Cursor::new(cert_pem.as_bytes());
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to parse TLS certificates from PEM")?;
+
+    let mut key_reader = std::io::Cursor::new(key_pem.as_bytes());
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("Failed to parse TLS private key from PEM")?
+        .context("No private key found in PEM")?;
+
+    Ok((certs, key))
+}
+
 fn load_certs_and_key(
     cert_path: Option<&PathBuf>,
     key_path: Option<&PathBuf>,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     if let (Some(cp), Some(kp)) = (cert_path, key_path) {
-        let cert_file = File::open(cp).with_context(|| format!("Failed to open cert file {:?}", cp))?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("Failed to parse TLS certificates")?;
-
-        let key_file = File::open(kp).with_context(|| format!("Failed to open key file {:?}", kp))?;
-        let mut key_reader = BufReader::new(key_file);
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .context("Failed to parse TLS private key")?
-            .context("No private key found in key file")?;
-
-        Ok((certs, key))
-    } else {
-        info!("No certificate supplied; generating ephemeral self-signed host certificate");
-        generate_self_signed_cert(vec!["localhost".to_string(), "0.0.0.0".to_string()])
+        return load_pem_cert_and_key_files(cp, kp);
     }
+
+    let (default_cert, default_key) = default_host_cert_and_key_paths();
+
+    if default_cert.exists() && default_key.exists() {
+        match load_pem_cert_and_key_files(&default_cert, &default_key) {
+            Ok(pair) => {
+                info!(
+                    cert = ?default_cert,
+                    key = ?default_key,
+                    "Loaded persistent host certificate and key from disk"
+                );
+                return Ok(pair);
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to read existing host certificate/key from disk, generating new ones"
+                );
+            }
+        }
+    }
+
+    // Generate new self-signed certificate and private key
+    let (cert_pem, key_pem) = generate_self_signed_cert_pem(vec![
+        "localhost".to_string(),
+        "0.0.0.0".to_string(),
+        "127.0.0.1".to_string(),
+    ])?;
+
+    // Attempt to persist to disk
+    let mut persisted = false;
+    if let Some(parent) = default_cert.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if std::fs::write(&default_cert, &cert_pem).is_ok() {
+        if std::fs::write(&default_key, &key_pem).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&default_key, std::fs::Permissions::from_mode(0o600));
+            }
+            persisted = true;
+            info!(
+                cert = ?default_cert,
+                key = ?default_key,
+                "Generated and saved persistent host certificate and key to disk"
+            );
+        } else {
+            let _ = std::fs::remove_file(&default_cert);
+        }
+    }
+
+    if !persisted {
+        info!("No persistent certificate supplied; generating ephemeral self-signed host certificate");
+    }
+
+    parse_pem_cert_and_key(&cert_pem, &key_pem)
 }
 
 async fn handle_connection(
