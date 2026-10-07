@@ -784,3 +784,34 @@ For future operational maintenance, release engineering, and platform extensions
     - Supports `StrictHostKeyChecking` modes (`ask`, `accept-new`, `yes`, `no`), parsing `-o StrictHostKeyChecking=...` and TOML configuration files.
     - Synchronizes interactive prompt decisions between QUIC and TCP fallback handshakes to prevent duplicate prompts.
   - Added unit tests in `known_hosts.rs` and daemon integration test `test_tofu_known_hosts_auto_record_and_reconnect`, reaching 128 passing tests workspace-wide.
+
+### 2026-10-07 — Root Privilege Dropping & Authenticated User Session Isolation Fix
+- Fixed security vulnerability where running `morshd` as `root` resulted in normal authenticated users (`morsh liu@localhost:2222`) landing in a `root` shell (`root@I ~ # #`) instead of dropping privileges to the target user.
+- Root Cause:
+  - `PtySession::spawn` used `portable_pty::CommandBuilder` which only configured environment variables (`USER`, `LOGNAME`).
+  - `portable_pty` had no mechanism to drop POSIX privileges (`setuid`, `setgid`, `initgroups`), change UID/GID, or initialize the user's home directory (`HOME`, `PWD`, `working_dir`).
+  - As a result, when `morshd` ran as root, child shell sessions retained full UID 0 privileges, `/root` working directory, and root environment.
+- Resolution & Architectural Enhancements:
+  - Implemented `crates/morsh-term/src/user.rs`:
+    - Created thread-safe `UserInfo::lookup` using `getpwnam_r` and `getgrouplist` to resolve user's UID, primary GID, supplementary group lists, home directory (`pw_dir`), and default shell (`pw_shell`).
+  - Implemented direct Unix child process spawning with POSIX privilege dropping in `crates/morsh-term/src/pty.rs` (`spawn_unix_as_user`):
+    - Sets up user environment: `USER`, `LOGNAME`, `HOME`, `SHELL`, `PWD`, and default clean `PATH`.
+    - Automatically sets session working directory to the target user's home directory (`pw_dir`).
+    - Strips sensitive daemon and root environment variables (`SUDO_USER`, `SUDO_UID`, `SUDO_GID`, `SUDO_COMMAND`) and sets `XDG_RUNTIME_DIR` to `/run/user/<uid>` if present.
+    - Sets login shell `arg0` (`-bash`, `-zsh`, etc.) to trigger login profile initialization (`/etc/profile`, `~/.bashrc`, `~/.zprofile`).
+    - Modifies slave PTY device ownership (`chown` to `target_uid:target_gid`, `chmod` to `0620`) when running with root privileges.
+    - Drops privileges inside `Command::pre_exec` before executing the shell:
+      1. Resets signal masks and dispositions.
+      2. Calls `setsid()` to establish a new session.
+      3. Calls `ioctl(0, TIOCSCTTY, 0)` to set the slave PTY as the controlling terminal.
+      4. Drops supplementary groups via `setgroups(groups)` (falling back to `initgroups`).
+      5. Drops primary group via `setgid(target_gid)`.
+      6. Drops primary user privileges via `setuid(target_uid)`.
+    - Ensures unprivileged daemons cannot arbitrarily impersonate different users without root privileges (`Permission denied`).
+  - Added unit and integration tests:
+    - `test_pty_spawn_with_current_user_and_env`: verifies environment variable and home directory resolution.
+    - `test_pty_spawn_nonexistent_user_error`: verifies safe error handling when target user does not exist.
+    - `test_pty_spawn_unprivileged_switch_denied`: verifies unprivileged daemon cannot switch to root.
+    - `test_authenticated_user_session_execution`: end-to-end integration test verifying Ed25519 public key authentication and command execution in user session.
+  - Test suite status: All 132 tests passing workspace-wide with 0 warnings.
+

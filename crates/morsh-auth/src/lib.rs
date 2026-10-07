@@ -22,7 +22,7 @@ pub use keys::{
     sign_challenge,
 };
 pub use pam::{MockPasswordVerifier, PamAuthenticator, PasswordVerifier};
-pub use ssh_key::{Algorithm, PrivateKey, PublicKey, Signature};
+pub use ssh_key::{self, Algorithm, PrivateKey, PublicKey, Signature};
 
 /// Returns the current authentication subsystem version string.
 pub fn auth_subsystem_version() -> &'static str {

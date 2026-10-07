@@ -361,3 +361,70 @@ fn test_tofu_known_hosts_auto_record_and_reconnect() {
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     assert!(stdout2.contains("TOFU_STEP_2"));
 }
+
+#[test]
+fn test_authenticated_user_session_execution() {
+    let current_user = match std::env::var("USER") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return,
+    };
+
+    let port = get_free_port();
+    let temp_dir = std::env::temp_dir().join(format!("morsh_auth_test_{}", port));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    use morsh_auth::ssh_key::rand_core::OsRng;
+    use morsh_auth::ssh_key::LineEnding;
+    use morsh_auth::{Algorithm, PrivateKey};
+    let sk = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+    let pk = sk.public_key();
+
+    let key_path = temp_dir.join("id_ed25519");
+    let ak_path = temp_dir.join("authorized_keys");
+
+    sk.write_openssh_file(&key_path, LineEnding::LF).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+    }
+    fs::write(&ak_path, format!("{}\n", pk.to_openssh().unwrap())).unwrap();
+
+    let child = Command::new(morshd_bin())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--auth-keys")
+        .arg(&ak_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start morshd daemon");
+
+    let _guard = DaemonGuard { child };
+    std::thread::sleep(Duration::from_millis(300));
+
+    let destination = format!("{}@127.0.0.1", current_user);
+    let out = Command::new(morsh_bin())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-k")
+        .arg("-i")
+        .arg(&key_path)
+        .arg(&destination)
+        .arg("echo")
+        .arg("AUTH_EXEC_SUCCESS")
+        .stdin(Stdio::null())
+        .output()
+        .expect("Failed to execute remote command via authenticated morsh");
+
+    assert!(out.status.success(), "Authenticated execution should succeed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("AUTH_EXEC_SUCCESS"),
+        "Output should contain execution result, got: {}",
+        stdout
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+

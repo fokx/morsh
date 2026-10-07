@@ -8,6 +8,8 @@ pub mod error;
 pub mod io;
 pub mod pty;
 pub mod session;
+#[cfg(unix)]
+pub mod user;
 
 pub use buffer::{new_shared_buffer, SharedTerminalBuffer, TerminalStateBuffer};
 pub use config::{resolve_shell, PtyConfig};
@@ -16,6 +18,8 @@ pub use io::{AsyncPtyReader, AsyncPtyWriter};
 pub use portable_pty::ExitStatus;
 pub use pty::{PtyHandle, PtySession};
 pub use session::{PersistentSession, SessionRegistry};
+#[cfg(unix)]
+pub use user::UserInfo;
 
 pub fn term_subsystem_version() -> &'static str {
     "0.1.0"
@@ -174,5 +178,100 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let status = handle.try_wait().unwrap();
         assert!(status.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pty_spawn_with_current_user_and_env() {
+        let current_user = match std::env::var("USER") {
+            Ok(u) if !u.is_empty() => u,
+            _ => return, // Skip if USER not set in test environment
+        };
+
+        let mut config = PtyConfig::default();
+        config.user = Some(current_user.clone());
+        config.command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo \"user=$USER home=$HOME\"".into(),
+        ]);
+
+        let session = PtySession::spawn(&config).expect("Should spawn for current user");
+        let (_handle, mut reader, _writer) = session.split();
+
+        let mut output = Vec::new();
+        let mut buf = [0u8; 1024];
+        let timeout = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(timeout);
+
+        loop {
+            tokio::select! {
+                res = reader.read(&mut buf) => {
+                    match res {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            output.extend_from_slice(&buf[..n]);
+                            if output.windows(b"user=".len()).any(|w| w == b"user=") {
+                                break;
+                            }
+                        }
+                        Err(e) => panic!("Read error: {}", e),
+                    }
+                }
+                _ = &mut timeout => {
+                    panic!("Timed out waiting for output");
+                }
+            }
+        }
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains(&format!("user={}", current_user)),
+            "Expected output to contain user={}, got: {}",
+            current_user,
+            output_str
+        );
+        assert!(
+            output_str.contains("home="),
+            "Expected output to contain home=, got: {}",
+            output_str
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pty_spawn_nonexistent_user_error() {
+        let mut config = PtyConfig::default();
+        config.user = Some("nonexistent_user_morsh_99999".into());
+
+        let res = PtySession::spawn(&config);
+        assert!(res.is_err(), "Spawning as nonexistent user must fail");
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("not found in system passwd database"),
+            "Expected 'not found', got: {}",
+            err
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pty_spawn_unprivileged_switch_denied() {
+        let current_euid = unsafe { libc::geteuid() };
+        if current_euid == 0 {
+            return; // Only applies when running unprivileged
+        }
+
+        let mut config = PtyConfig::default();
+        config.user = Some("root".into());
+
+        let res = PtySession::spawn(&config);
+        assert!(res.is_err(), "Unprivileged daemon must not switch to root");
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("Permission denied"),
+            "Expected 'Permission denied', got: {}",
+            err
+        );
     }
 }
