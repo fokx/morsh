@@ -257,6 +257,9 @@ pub enum TunnelType {
 /// 4-byte magic preamble for tunnel QUIC streams.
 pub const TUNNEL_STREAM_MAGIC: [u8; 4] = *b"MTUN";
 
+/// 4-byte magic preamble for interactive PTY QUIC streams.
+pub const PTY_STREAM_MAGIC: [u8; 4] = *b"MPTY";
+
 /// Preamble sent at the start of a forwarded QUIC stream.
 /// Identifies which tunnel_id the stream belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -25,6 +25,7 @@ pub struct ConfidenceTracker {
     no_echo_active: bool,
     last_divergence_time: Option<Instant>,
     cooldown_duration: Duration,
+    current_rtt: Option<Duration>,
 }
 
 impl Default for ConfidenceTracker {
@@ -44,7 +45,18 @@ impl ConfidenceTracker {
             no_echo_active: false,
             last_divergence_time: None,
             cooldown_duration: Duration::from_millis(500),
+            current_rtt: None,
         }
+    }
+
+    /// Sets the current round-trip time for latency-adaptive prediction heuristics.
+    pub fn set_rtt(&mut self, rtt: Duration) {
+        self.current_rtt = Some(rtt);
+    }
+
+    /// Current round-trip time if set.
+    pub fn rtt(&self) -> Option<Duration> {
+        self.current_rtt
     }
 
     /// Custom cooldown constructor for testing or latency-adaptive tuning.
@@ -91,6 +103,14 @@ impl ConfidenceTracker {
         }
 
         // Auto mode heuristics
+        // On low-latency links (< 50ms RTT), predictive local echo is unnecessary
+        // and can cause visual collisions with complex shell prompts, autosuggestions, or syntax highlighters.
+        if let Some(rtt) = self.current_rtt {
+            if rtt < Duration::from_millis(50) {
+                return false;
+            }
+        }
+
         match self.level {
             ConfidenceLevel::High => true,
             ConfidenceLevel::Tentative => true,
@@ -226,6 +246,22 @@ mod tests {
 
         tracker.set_no_echo(false);
         assert_eq!(tracker.level(), ConfidenceLevel::Tentative);
+        assert!(tracker.can_predict(PredictMode::Auto));
+    }
+
+    #[test]
+    fn test_latency_adaptive_prediction() {
+        let mut tracker = ConfidenceTracker::new();
+        // Under 50ms RTT, auto mode suppresses prediction
+        tracker.set_rtt(Duration::from_millis(10));
+        assert!(!tracker.can_predict(PredictMode::Auto));
+        // But Always mode still predicts
+        assert!(tracker.can_predict(PredictMode::Always));
+
+        // At or above 50ms RTT, auto mode predicts
+        tracker.set_rtt(Duration::from_millis(50));
+        assert!(tracker.can_predict(PredictMode::Auto));
+        tracker.set_rtt(Duration::from_millis(150));
         assert!(tracker.can_predict(PredictMode::Auto));
     }
 }

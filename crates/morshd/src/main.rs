@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use morsh_auth::{generate_challenge, AuthorizedKeys, PamAuthenticator, PasswordVerifier};
 use morsh_core::protocol::{
-    AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PROTOCOL_VERSION,
+    AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PTY_STREAM_MAGIC,
+    PROTOCOL_VERSION,
 };
 use morsh_term::{PersistentSession, PtyConfig, SessionRegistry};
 use morsh_transport::{
@@ -536,6 +537,18 @@ async fn handle_connection(
                 pty_spawned_stream.store(true, std::sync::atomic::Ordering::SeqCst);
                 let (mut pty_send, mut pty_recv) = (stream_send, stream_recv);
 
+                let mut initial_input = Vec::new();
+                let mut preamble = [0u8; 4];
+                match pty_recv.read(&mut preamble).await {
+                    Ok(Some(4)) if preamble == PTY_STREAM_MAGIC => {
+                        debug!("Recognized PTY_STREAM_MAGIC on stream 1");
+                    }
+                    Ok(Some(n)) if n > 0 => {
+                        initial_input.extend_from_slice(&preamble[..n]);
+                    }
+                    _ => {}
+                }
+
                 let session_opt = active_session_for_accept.lock().await.clone();
                 let session = match session_opt {
                     Some(s) => s,
@@ -584,6 +597,10 @@ async fn handle_connection(
 
                 let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                 session.attach(client_tx).await;
+
+                if !initial_input.is_empty() {
+                    let _ = session.write_input(&initial_input).await;
+                }
 
                 let pty_out = tokio::spawn(async move {
                     while let Some(chunk) = client_rx.recv().await {

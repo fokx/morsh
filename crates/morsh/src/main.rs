@@ -4,7 +4,8 @@ use morsh_auth::{
     find_first_default_private_key, load_private_key_file, sign_challenge, AgentClient,
 };
 use morsh_core::protocol::{
-    AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PROTOCOL_VERSION,
+    AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PTY_STREAM_MAGIC,
+    PROTOCOL_VERSION,
 };
 use morsh_transport::{
     connect_happy_eyeballs, default_known_hosts_path, make_client_config_from_rustls,
@@ -906,6 +907,11 @@ async fn main() -> Result<()> {
             .await
             .context("Failed to open interactive PTY stream")?;
 
+        // Send PTY stream magic preamble immediately so that QUIC transmits a STREAM frame
+        // and server can immediately accept Stream 1 and spawn the interactive shell without waiting for input.
+        pty_send.write_all(&PTY_STREAM_MAGIC).await?;
+        pty_send.flush().await?;
+
         let _guard = if is_tty {
             Some(RawModeGuard::enter()?)
         } else {
@@ -934,6 +940,7 @@ async fn main() -> Result<()> {
         let predict_mode = effective_predict.parse::<morsh_predict::PredictMode>().unwrap_or_default();
         let predict_style = effective_predict_style.parse::<morsh_predict::PredictStyle>().unwrap_or_default();
         let mut predict_engine = morsh_predict::PredictionEngine::new(predict_mode, predict_style);
+        predict_engine.set_rtt(conn.rtt());
 
         loop {
             tokio::select! {
@@ -941,6 +948,7 @@ async fn main() -> Result<()> {
                 out_res = pty_recv.read(&mut out_buf) => {
                     match out_res {
                         Ok(Some(n)) if n > 0 => {
+                            predict_engine.set_rtt(conn.rtt());
                             let srv_res = predict_engine.process_server_output(&out_buf[..n]);
                             if stdout.write_all(&srv_res.output_to_render).await.is_err() {
                                 break;
@@ -1064,7 +1072,7 @@ async fn main() -> Result<()> {
             println!("[To resume, run: morsh {} --resume {}]\r\n", dest_str, hex_encode(&session_id));
             drop(ctrl_tx);
             conn.close(0, "session detached");
-            return Ok(());
+            std::process::exit(0);
         }
     }
 
@@ -1086,7 +1094,7 @@ async fn main() -> Result<()> {
     if !is_tty && args.ping > 0 {
         println!("Session cleanly terminated.");
     }
-    Ok(())
+    std::process::exit(0);
 }
 
 async fn handle_client_control_msg(
@@ -1172,6 +1180,11 @@ struct RawModeGuard {
 impl RawModeGuard {
     fn enter() -> Result<Self> {
         crossterm::terminal::enable_raw_mode().context("Failed to enable raw terminal mode")?;
+        let default_panic = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::terminal::disable_raw_mode();
+            default_panic(info);
+        }));
         Ok(Self { active: true })
     }
 }

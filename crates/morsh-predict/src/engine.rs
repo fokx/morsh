@@ -91,6 +91,16 @@ impl PredictionEngine {
         self.pending_predictions.len()
     }
 
+    /// Sets the current round-trip time for latency-adaptive prediction heuristics.
+    pub fn set_rtt(&mut self, rtt: std::time::Duration) {
+        self.confidence.set_rtt(rtt);
+    }
+
+    /// Current round-trip time if set.
+    pub fn rtt(&self) -> Option<std::time::Duration> {
+        self.confidence.rtt()
+    }
+
     /// Processes user input from local stdin.
     pub fn process_input(&mut self, input: &[u8]) -> InputProcessResult {
         let keystrokes = parse_keystrokes(input);
@@ -278,21 +288,11 @@ impl PredictionEngine {
             }
         }
 
-        if matched_count > 0 {
-            for _ in 0..matched_count {
-                if let Some(p) = self.pending_predictions.pop_front() {
-                    if p.cols_advanced > 0 {
-                        self.active_speculative_cols =
-                            self.active_speculative_cols.saturating_sub(p.cols_advanced as usize);
-                    }
-                }
-            }
-            self.confidence.on_success();
-        }
+        let old_speculative_cols = self.active_speculative_cols;
 
         // If divergence occurred or server produced unexpected non-matching output while predictions exist
-        if diverged || (matched_count == 0 && !output.is_empty() && self.active_speculative_cols > 0) {
-            let rollback = generate_rollback(self.active_speculative_cols);
+        if diverged || (matched_count == 0 && !output.is_empty() && old_speculative_cols > 0) {
+            let rollback = generate_rollback(old_speculative_cols);
             self.active_speculative_cols = 0;
             self.pending_predictions.clear();
             self.confidence.on_divergence();
@@ -304,6 +304,39 @@ impl PredictionEngine {
             return ServerOutputResult {
                 confirmed_seq,
                 had_divergence: true,
+                output_to_render,
+            };
+        }
+
+        if matched_count > 0 {
+            for _ in 0..matched_count {
+                self.pending_predictions.pop_front();
+            }
+            self.confidence.on_success();
+        }
+
+        // When predictions were active, the local terminal rendered speculative characters.
+        // To prevent doubling/ghosting when the server echoes back the confirmed output,
+        // we roll back the speculative display, emit the authoritative server output,
+        // and re-render any remaining unconfirmed predictions.
+        if old_speculative_cols > 0 {
+            let rollback = generate_rollback(old_speculative_cols);
+            let mut output_to_render = Vec::with_capacity(rollback.len() + output.len());
+            output_to_render.extend_from_slice(&rollback);
+            output_to_render.extend_from_slice(output);
+
+            let mut new_speculative_cols = 0;
+            for p in self.pending_predictions.iter() {
+                output_to_render.extend_from_slice(&p.speculative_display);
+                if p.cols_advanced > 0 {
+                    new_speculative_cols += p.cols_advanced as usize;
+                }
+            }
+            self.active_speculative_cols = new_speculative_cols;
+
+            return ServerOutputResult {
+                confirmed_seq,
+                had_divergence: false,
                 output_to_render,
             };
         }
@@ -362,7 +395,7 @@ mod tests {
         let out_res = engine.process_server_output(b"ls");
         assert_eq!(out_res.had_divergence, false);
         assert_eq!(out_res.confirmed_seq, Some(2));
-        assert_eq!(out_res.output_to_render, b"ls");
+        assert_eq!(out_res.output_to_render, b"\x1b[2D\x1b[Kls");
         assert_eq!(engine.active_speculative_cols(), 0);
         assert_eq!(engine.pending_count(), 0);
     }
