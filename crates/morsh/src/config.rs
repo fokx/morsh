@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use morsh_transport::StrictHostKeyCheckingMode;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -101,6 +102,9 @@ pub struct HostRule {
     /// Accept self-signed / unverified server certs
     pub insecure: Option<bool>,
 
+    /// Host key checking mode ("ask", "accept-new", "yes", "no")
+    pub strict_host_key_checking: Option<StrictHostKeyCheckingMode>,
+
     /// Query ssh-agent
     pub forward_agent: Option<bool>,
 
@@ -139,7 +143,7 @@ pub struct ClientConfig {
     /// Default stealth knock
     pub stealth_knock: Option<String>,
 
-    /// Default force TCP
+    /// Force TCP
     pub force_tcp: Option<bool>,
 
     /// Default fallback delay in milliseconds
@@ -153,6 +157,9 @@ pub struct ClientConfig {
 
     /// Default insecure certificate acceptance
     pub insecure: Option<bool>,
+
+    /// Default host key checking mode
+    pub strict_host_key_checking: Option<StrictHostKeyCheckingMode>,
 
     /// Default agent query
     pub forward_agent: Option<bool>,
@@ -229,6 +236,7 @@ impl ClientConfig {
             predict_mode: self.predict_mode.clone(),
             predict_style: self.predict_style.clone(),
             insecure: self.insecure,
+            strict_host_key_checking: self.strict_host_key_checking,
             forward_agent: self.forward_agent,
             compress: self.compress,
             local_forward: self.local_forward.clone(),
@@ -269,6 +277,9 @@ impl ClientConfig {
                 if let Some(ins) = rule.insecure {
                     merged.insecure = Some(ins);
                 }
+                if let Some(shkc) = rule.strict_host_key_checking {
+                    merged.strict_host_key_checking = Some(shkc);
+                }
                 if let Some(fa) = rule.forward_agent {
                     merged.forward_agent = Some(fa);
                 }
@@ -293,7 +304,7 @@ pub struct OpenSshOptions {
     pub user: Option<String>,
     pub identity_file: Option<PathBuf>,
     pub forward_agent: Option<bool>,
-    pub strict_host_key_checking: Option<bool>,
+    pub strict_host_key_checking: Option<StrictHostKeyCheckingMode>,
     pub server_alive_interval: Option<u64>,
     pub connect_timeout: Option<u64>,
     pub compress: Option<bool>,
@@ -341,9 +352,17 @@ impl OpenSshOptions {
                     parsed.forward_agent = Some(matches_bool_str(val));
                 }
                 "stricthostkeychecking" => {
-                    // "no" means insecure certificate validation
-                    let strict = val.eq_ignore_ascii_case("yes");
-                    parsed.strict_host_key_checking = Some(strict);
+                    let mode = match val.to_lowercase().as_str() {
+                        "no" | "off" => StrictHostKeyCheckingMode::No,
+                        "accept-new" => StrictHostKeyCheckingMode::AcceptNew,
+                        "yes" => StrictHostKeyCheckingMode::Yes,
+                        "ask" => StrictHostKeyCheckingMode::Ask,
+                        _ => {
+                            tracing::warn!("Unknown StrictHostKeyChecking value: '{}', defaulting to ask", val);
+                            StrictHostKeyCheckingMode::Ask
+                        }
+                    };
+                    parsed.strict_host_key_checking = Some(mode);
                 }
                 "compression" => {
                     parsed.compress = Some(matches_bool_str(val));
@@ -493,7 +512,7 @@ port = 2200
         assert_eq!(parsed.port, Some(2222));
         assert_eq!(parsed.user.as_deref(), Some("testuser"));
         assert_eq!(parsed.forward_agent, Some(true));
-        assert_eq!(parsed.strict_host_key_checking, Some(false));
+        assert_eq!(parsed.strict_host_key_checking, Some(StrictHostKeyCheckingMode::No));
         assert_eq!(parsed.compress, Some(true));
         assert_eq!(parsed.stealth_knock.as_deref(), Some("/myknock"));
         assert_eq!(parsed.force_tcp, Some(true));

@@ -7,8 +7,9 @@ use morsh_core::protocol::{
     AuthMethod, AuthRequest, ControlMessage, TunnelStreamPreamble, TunnelType, PROTOCOL_VERSION,
 };
 use morsh_transport::{
-    connect_happy_eyeballs, make_client_config_from_rustls, make_rustls_client_config,
-    MorshConnection, QuicClient,
+    connect_happy_eyeballs, default_known_hosts_path, make_client_config_from_rustls,
+    make_tofu_rustls_client_config, MorshConnection, QuicClient, StrictHostKeyCheckingMode,
+    TofuOptions,
 };
 use morsh_tunnel::{
     decode_udp_datagram, request_remote_forward, run_dynamic_socks5, run_local_forward,
@@ -322,9 +323,21 @@ async fn main() -> Result<()> {
         .or(client_cfg.identity_file);
 
     let effective_insecure = args.insecure
-        || openssh_opts.strict_host_key_checking == Some(false)
+        || openssh_opts.strict_host_key_checking == Some(StrictHostKeyCheckingMode::No)
         || matched_rule.insecure.unwrap_or(false)
         || client_cfg.insecure.unwrap_or(false);
+
+    let effective_strict_host_key_checking = if effective_insecure {
+        StrictHostKeyCheckingMode::No
+    } else if let Some(mode) = openssh_opts.strict_host_key_checking {
+        mode
+    } else if let Some(mode) = matched_rule.strict_host_key_checking {
+        mode
+    } else if let Some(mode) = client_cfg.strict_host_key_checking {
+        mode
+    } else {
+        StrictHostKeyCheckingMode::Ask
+    };
 
     let effective_no_agent = args.no_agent
         || openssh_opts.forward_agent == Some(false)
@@ -409,7 +422,16 @@ async fn main() -> Result<()> {
             .with_context(|| format!("Could not find any IP address for '{}'", target))?
     };
 
-    let rustls_client_config = make_rustls_client_config(effective_insecure)
+    let tofu_options = TofuOptions {
+        target_host: target_host.clone(),
+        target_port,
+        remote_addr: Some(remote_addr),
+        known_hosts_path: default_known_hosts_path(),
+        strict_mode: effective_strict_host_key_checking,
+        insecure: effective_insecure,
+    };
+
+    let rustls_client_config = make_tofu_rustls_client_config(tofu_options)
         .context("Failed to initialize client TLS transport configuration")?;
     let quic_client_config = make_client_config_from_rustls(rustls_client_config.clone())
         .context("Failed to initialize QUIC client transport configuration")?;

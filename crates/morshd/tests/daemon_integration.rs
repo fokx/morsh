@@ -312,3 +312,52 @@ fn test_remote_command_execution() {
         stdout
     );
 }
+
+#[test]
+fn test_tofu_known_hosts_auto_record_and_reconnect() {
+    let port = get_free_port();
+
+    let child = Command::new(morshd_bin())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--no-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start morshd daemon");
+
+    let _guard = DaemonGuard { child };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // First connection: use StrictHostKeyChecking=accept-new to record host key into known_hosts
+    let out1 = Command::new(morsh_bin())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("127.0.0.1")
+        .arg("echo")
+        .arg("TOFU_STEP_1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("Failed to execute remote command via morsh with accept-new");
+
+    assert!(out1.status.success(), "First connection with accept-new should succeed");
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    assert!(stdout1.contains("TOFU_STEP_1"));
+
+    // Second connection: NO -k and NO -o flags! Should verify against known_hosts and succeed!
+    let out2 = Command::new(morsh_bin())
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("127.0.0.1")
+        .arg("echo")
+        .arg("TOFU_STEP_2")
+        .stdin(Stdio::null())
+        .output()
+        .expect("Failed to execute remote command via morsh against known_hosts");
+
+    assert!(out2.status.success(), "Second connection without flags should verify via known_hosts");
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("TOFU_STEP_2"));
+}

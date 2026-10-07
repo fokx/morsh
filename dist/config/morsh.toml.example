@@ -32,6 +32,9 @@
 # Accept unverified / self-signed server certificates (testing only)
 # insecure = false
 
+# Host key verification policy ("ask", "accept-new", "yes", "no")
+# strict_host_key_checking = "ask"
+
 # Request stream compression
 # compress = false
 

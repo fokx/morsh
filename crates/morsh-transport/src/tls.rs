@@ -137,6 +137,51 @@ pub fn make_rustls_client_config(insecure: bool) -> Result<Arc<rustls::ClientCon
     Ok(Arc::new(rustls_config))
 }
 
+use crate::known_hosts::{StrictHostKeyCheckingMode, TofuServerCertVerifier, TofuSharedState};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+/// Options for Trust-On-First-Use (TOFU) host certificate verification.
+#[derive(Debug, Clone)]
+pub struct TofuOptions {
+    pub target_host: String,
+    pub target_port: u16,
+    pub remote_addr: Option<SocketAddr>,
+    pub known_hosts_path: PathBuf,
+    pub strict_mode: StrictHostKeyCheckingMode,
+    pub insecure: bool,
+}
+
+/// Builds a rustls ClientConfig that uses OpenSSH-compatible TOFU host key verification.
+pub fn make_tofu_rustls_client_config(options: TofuOptions) -> Result<Arc<rustls::ClientConfig>> {
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = root_store.add(cert);
+    }
+    let webpki_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+        .build()
+        .ok();
+
+    let verifier = TofuServerCertVerifier {
+        target_host: options.target_host,
+        target_port: options.target_port,
+        remote_addr: options.remote_addr,
+        known_hosts_path: options.known_hosts_path,
+        strict_mode: options.strict_mode,
+        insecure: options.insecure,
+        webpki_verifier,
+        shared_state: Arc::new(std::sync::Mutex::new(TofuSharedState::default())),
+    };
+
+    let mut rustls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+
+    rustls_config.alpn_protocols = vec![morsh_core::ALPN_MORSH.to_vec()];
+    Ok(Arc::new(rustls_config))
+}
+
 /// Builds a Quinn ClientConfig from an existing rustls ClientConfig.
 pub fn make_client_config_from_rustls(
     rustls_config: Arc<rustls::ClientConfig>,

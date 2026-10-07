@@ -768,3 +768,19 @@ For future operational maintenance, release engineering, and platform extensions
   - Example annotated TOML configuration templates in `dist/config/`.
 - Added 23 new tests: 1 in `morsh-core`, 7 in `morsh`, 3 in `morshd`, and 6 integration tests in `daemon_integration.rs`, reaching 126 passing tests workspace-wide with 0 warnings.
 - Verified live end-to-end execution of non-interactive remote command execution, config file alias resolution, and dynamic `SIGHUP` configuration reload.
+
+### 2026-10-07 — Host Key Verification & TOFU (Trust-On-First-Use) Fix
+- Fixed `invalid peer certificate: UnknownIssuer` failure when connecting to `morshd`'s default self-signed host certificate.
+- Root Cause:
+  - `morshd` defaults to generating an ephemeral self-signed host certificate when launched without `--cert`/`--key`.
+  - `morsh` previously only validated certificates using OS root CAs (Web PKI) when `insecure = false`, rejecting self-signed certificates with `UnknownIssuer`.
+- Resolution & Architectural Enhancements:
+  - Implemented OpenSSH-compatible **Trust-On-First-Use (TOFU)** and `known_hosts` verification in `crates/morsh-transport/src/known_hosts.rs`.
+  - Added `KnownHosts` parser and persistence manager maintaining `~/.morsh/known_hosts`.
+  - Added `TofuServerCertVerifier` implementing rustls `ServerCertVerifier`:
+    - First attempts Web PKI verification (for servers with CA-signed certificates).
+    - Falls back to `known_hosts` fingerprint lookup (SHA-256).
+    - Rejects changed host keys with OpenSSH-style MITM attack warning banners.
+    - Supports `StrictHostKeyChecking` modes (`ask`, `accept-new`, `yes`, `no`), parsing `-o StrictHostKeyChecking=...` and TOML configuration files.
+    - Synchronizes interactive prompt decisions between QUIC and TCP fallback handshakes to prevent duplicate prompts.
+  - Added unit tests in `known_hosts.rs` and daemon integration test `test_tofu_known_hosts_auto_record_and_reconnect`, reaching 128 passing tests workspace-wide.

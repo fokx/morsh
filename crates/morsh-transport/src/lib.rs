@@ -1,6 +1,7 @@
 pub mod client;
 pub mod connection;
 pub mod happy_eyeballs;
+pub mod known_hosts;
 pub mod server;
 pub mod stream;
 pub mod tcp;
@@ -10,6 +11,10 @@ pub mod tls;
 pub use client::QuicClient;
 pub use connection::{generate_session_id, MorshConnection};
 pub use happy_eyeballs::{connect_happy_eyeballs, DEFAULT_FALLBACK_DELAY};
+pub use known_hosts::{
+    default_known_hosts_path, KnownHostEntry, KnownHostStatus, KnownHosts,
+    StrictHostKeyCheckingMode, TofuServerCertVerifier, TofuSharedState,
+};
 pub use server::QuicServer;
 pub use stream::{MorshRecvStream, MorshSendStream, MorshStreamId};
 pub use tcp::{TcpClient, TcpServer};
@@ -17,7 +22,8 @@ pub use tcp_mux::TcpConnection;
 pub use tls::{
     cert_fingerprint_sha256, generate_self_signed_cert, make_client_config,
     make_client_config_from_rustls, make_rustls_client_config, make_rustls_server_config,
-    make_server_config, make_server_config_from_rustls, SkipServerVerification,
+    make_server_config, make_server_config_from_rustls, make_tofu_rustls_client_config,
+    SkipServerVerification, TofuOptions,
 };
 
 #[cfg(test)]
