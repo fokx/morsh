@@ -29,7 +29,7 @@ pub use udp::{
 };
 
 pub fn tunnel_subsystem_version() -> &'static str {
-    "0.1.0"
+    "0.2.0"
 }
 
 #[cfg(test)]
@@ -38,6 +38,6 @@ mod tests {
 
     #[test]
     fn test_tunnel_subsystem_version() {
-        assert_eq!(tunnel_subsystem_version(), "0.1.0");
+        assert_eq!(tunnel_subsystem_version(), "0.2.0");
     }
 }

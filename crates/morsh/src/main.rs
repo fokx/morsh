@@ -29,7 +29,7 @@ use config::{ClientConfig, OpenSshOptions};
 #[derive(Parser, Debug)]
 #[command(
     name = "morsh",
-    version = "0.1.0",
+    version = "0.2.0",
     about = "morsh - Next-generation resilient QUIC SSH client (combining Mosh & SSH3)"
 )]
 struct Args {
