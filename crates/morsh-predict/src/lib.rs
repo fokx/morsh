@@ -21,5 +21,5 @@ pub use rollback::generate_rollback;
 pub use style::{PredictMode, PredictStyle};
 
 pub fn predict_subsystem_version() -> &'static str {
-    "0.2.0"
+    "0.3.0"
 }

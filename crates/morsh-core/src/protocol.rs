@@ -53,7 +53,7 @@ pub enum ControlMessage {
     ClientHello {
         /// Protocol version spoken by the client.
         version: u32,
-        /// Client identifier string (e.g. "morsh-0.2.0").
+        /// Client identifier string (e.g. "morsh-0.3.0").
         client_software: String,
         /// Optional stealth knock path or secret token (SSH3 style).
         knock_path: Option<String>,
@@ -65,7 +65,7 @@ pub enum ControlMessage {
     ServerHello {
         /// Protocol version spoken by the server.
         version: u32,
-        /// Server identifier string (e.g. "morshd-0.2.0").
+        /// Server identifier string (e.g. "morshd-0.3.0").
         server_software: String,
         /// Unique session identifier generated or resumed for this connection.
         session_id: [u8; 16],

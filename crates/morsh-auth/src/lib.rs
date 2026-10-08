@@ -26,7 +26,7 @@ pub use ssh_key::{self, Algorithm, PrivateKey, PublicKey, Signature};
 
 /// Returns the current authentication subsystem version string.
 pub fn auth_subsystem_version() -> &'static str {
-    "0.2.0-phase2"
+    "0.3.0-phase2"
 }
 
 #[cfg(test)]
@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn test_auth_subsystem_version() {
-        assert_eq!(auth_subsystem_version(), "0.2.0-phase2");
+        assert_eq!(auth_subsystem_version(), "0.3.0-phase2");
     }
 
     #[test]

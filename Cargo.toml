@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["morsh contributors"]
@@ -26,12 +26,12 @@ categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 # Internal workspace crates
-morsh-core = { version = "0.2.0", path = "crates/morsh-core" }
-morsh-transport = { version = "0.2.0", path = "crates/morsh-transport" }
-morsh-auth = { version = "0.2.0", path = "crates/morsh-auth" }
-morsh-term = { version = "0.2.0", path = "crates/morsh-term" }
-morsh-predict = { version = "0.2.0", path = "crates/morsh-predict" }
-morsh-tunnel = { version = "0.2.0", path = "crates/morsh-tunnel" }
+morsh-core = { version = "0.3.0", path = "crates/morsh-core" }
+morsh-transport = { version = "0.3.0", path = "crates/morsh-transport" }
+morsh-auth = { version = "0.3.0", path = "crates/morsh-auth" }
+morsh-term = { version = "0.3.0", path = "crates/morsh-term" }
+morsh-predict = { version = "0.3.0", path = "crates/morsh-predict" }
+morsh-tunnel = { version = "0.3.0", path = "crates/morsh-tunnel" }
 
 # External async / networking dependencies
 tokio = { version = "1.43", features = ["full"] }

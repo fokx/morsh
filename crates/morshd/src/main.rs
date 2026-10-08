@@ -30,7 +30,7 @@ use config::ServerConfig;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "morshd",
-    version = "0.2.0",
+    version = "0.3.0",
     about = "morshd - Next-generation resilient QUIC SSH daemon (combining Mosh & SSH3)"
 )]
 struct Args {
