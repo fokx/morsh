@@ -16,8 +16,7 @@
 | **Phase 4** | Port Forwarding & Tunnels (TCP, UDP, SOCKS5) | ✅ **Completed** | 2026-10-06 | - | `morsh-tunnel`, `-L`, `-R`, `-D`, `-U`, `-N`, 57 tests |
 | **Phase 5** | Session Persistence & Screen State Recovery | ✅ **Completed** | 2026-10-06 | - | Detached PTY supervisor, 128-bit session tokens, `vt100` state sync, 65 tests |
 | **Phase 6** | Predictive Local Echo & Speculative UI | ✅ **Completed** | 2026-10-06 | - | Predictive echo engine, underline/dim styling, confidence heuristics, 1-RTT rollback, 92 tests |
-| **Phase 7** | TCP Fallback & Network Resilience | ✅ **Completed** | 2026-10-06 | - | Happy Eyeballs auto-detection, TLS 1.3 over TCP fallback, dual-stack `morshd`, 103 tests |
-| **Phase 8** | Production Polish, Configuration & Distribution | ✅ **Completed** | 2026-10-06 | - | OpenSSH CLI parity, TOML configs, SIGHUP reload, systemd unit, man/completions, 126 tests |
+| **Phase 8** | Production Polish, Configuration & Distribution | ✅ **Completed** | 2026-10-06 | - | OpenSSH CLI parity, TOML & ~/.ssh/config parser, SIGHUP reload, systemd unit, man/completions, 132 tests |
 
 
 ---
@@ -532,8 +531,8 @@
      - Trailing `[command...]`: Remote command execution via `/bin/sh -c <command>`.
      - `--completions <SHELL>`: Generate shell completions for `bash`, `zsh`, `fish`.
      - `--man`: Generate Section 1 UNIX roff man page to stdout.
-   - Implemented 5-tier configuration precedence cascade:
-     `Hardcoded Defaults < ~/.morsh/config.toml (global) < [[host]] Rule block < -o Options < CLI Flags`.
+   - Implemented 6-tier configuration precedence cascade:
+     `Hardcoded Defaults < ~/.ssh/config < ~/.morsh/config.toml (global) < [[host]] Rule block < -o Options < CLI Flags`.
 
 2. **Server Configuration & Signals (`crates/morshd`)**:
    - Added CLI flags:
@@ -546,9 +545,12 @@
    - Graceful shutdown:
      - Handled `SIGTERM` and `SIGINT` signals with structured connection close and session detachment before exit.
 
-3. **TOML Configuration System**:
+3. **TOML & OpenSSH Configuration System**:
    - Built `crates/morsh/src/config.rs`:
      - `ClientConfig` with global defaults and `[[host]]` blocks (`HostRule`).
+     - `SshConfigFile` native parser for `~/.ssh/config` supporting `Host` (space and comma-delimited, wildcards `*`, `?`, and `!negation`), `Match host <pat>` / `Match all`, `HostName` (with `%h` token expansion), `User`, `Port`, `IdentityFile`, `ForwardAgent`, `StrictHostKeyChecking`, `Compression`, `LocalForward`, `RemoteForward`, `DynamicForward`, `Include` (with recursive wildcard expansion and loop prevention), and Morsh custom extensions (`StealthKnock`, `ForceTcp`, `TcpFallbackTimeout`, `PredictMode`, `PredictStyle`, `Insecure`, `UdpForward`).
+     - OpenSSH standard "first-match-wins" semantics for scalar configuration values and list accumulation for forwards.
+     - Unified `load_configs` dispatcher: loads both `~/.morsh/config.toml` and `~/.ssh/config` by default, or auto-detects TOML vs OpenSSH syntax when explicit `-F <path>` is provided.
      - DP-based `wildcard_match` (`*`, `?`) with space-delimited patterns and OpenSSH `!pattern` negations.
      - `expand_tilde` path expansion for `~/.ssh/` and `~/.morsh/`.
      - `OpenSshOptions::parse_options` directive parser.
@@ -572,25 +574,31 @@
    - `dist/completions/`: shell completion scripts for `morsh` and `morshd` (`bash`, `zsh`, `fish`).
    - `dist/man/`: UNIX roff man pages (`morsh.1`, `morshd.8`).
 
-7. **Automated Test Suite (126 Tests Passing Workspace-Wide)**:
+7. **Automated Test Suite (132 Tests Passing Workspace-Wide)**:
    - **`morsh-core` (8 tests)**: added `test_exec_frames_roundtrip`.
-   - **`morsh` (7 unit tests)**:
+   - **`morsh` (12 unit tests)**:
      - `test_wildcard_matching`: single and multiple `*` and `?` patterns.
-     - `test_host_matches_negation_and_wildcard`: OpenSSH `!pattern` negation semantics.
-     - `test_parse_openssh_options`: OpenSSH `-o` parsing.
+     - `test_host_matches_space_and_negation`: OpenSSH `!pattern` negation semantics.
+     - `test_parse_open_ssh_options`: OpenSSH `-o` parsing.
      - `test_client_config_toml_parsing`: TOML configuration parsing.
-     - `test_args_parsing_defaults`: default CLI flag verification.
-     - `test_args_parsing_custom_flags`: custom CLI flag parsing.
+     - `test_tokenize_ssh_line`: OpenSSH directive tokenizer with comments and quotes.
+     - `test_ssh_config_first_match_semantics`: OpenSSH first-match-wins for scalars and list accumulation.
+     - `test_ssh_config_token_replacement_and_comma_hosts`: `%h` expansion and comma host matching.
+     - `test_ssh_config_includes`: recursive wildcard `Include` directive expansion.
+     - `test_load_configs_dispatch`: auto-detection of TOML vs SSH config formats.
+     - `test_parse_destination_various_formats`: destination address parsing.
+     - `test_parse_destination_invalid`: invalid address rejection.
      - `test_args_parsing_openssh_flags`: OpenSSH `-p`, `-i`, `-F`, `-o`, `-C`, `-4`, `-6`, `-v`.
    - **`morshd` (3 unit tests)**:
      - `test_server_config_toml_parsing`: TOML daemon configuration parsing.
      - `test_args_parsing_defaults`: default daemon flag verification.
      - `test_args_parsing_custom_flags`: custom daemon flags.
-   - **`morshd` Integration Tests (`crates/morshd/tests/daemon_integration.rs`, 6 tests)**:
+   - **`morshd` Integration Tests (`crates/morshd/tests/daemon_integration.rs`, 7 tests)**:
      - `test_cli_help_and_version`: `--help`, `--version`, and flag discovery.
      - `test_shell_completions_output`: shell completions generation for bash, zsh, fish.
      - `test_man_pages_output`: roff man page generation for `morsh.1` and `morshd.8`.
-     - `test_client_config_file_cascade`: live connection using config file host alias, custom knock, and forced TCP fallback.
+     - `test_client_config_file_cascade`: live connection using TOML config file host alias, custom knock, and forced TCP fallback.
+     - `test_client_ssh_config_file_cascade`: live connection using OpenSSH config file host alias (`HostName`, `Port`, `StealthKnock`, `ForceTcp`, `Insecure`).
      - `test_server_daemon_config_and_sighup_reload`: dynamic `SIGHUP` reload updating stealth knock path in memory on live running daemon.
      - `test_remote_command_execution`: non-interactive command execution over live QUIC connection.
 

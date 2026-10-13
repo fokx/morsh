@@ -278,6 +278,57 @@ insecure = true
 }
 
 #[test]
+fn test_client_ssh_config_file_cascade() {
+    let port = get_free_port();
+    let temp_dir = std::env::temp_dir().join(format!("morsh_client_ssh_cfg_{}", port));
+    let _ = fs::create_dir_all(&temp_dir);
+    let ssh_config_path = temp_dir.join("ssh_config");
+
+    // OpenSSH config matching "my-ssh-alias" -> resolves host_name, port, knock, force_tcp, insecure
+    let ssh_conf = format!(
+        r#"
+Host my-ssh-alias
+    HostName 127.0.0.1
+    Port {}
+    StealthKnock /custom-ssh-alias-knock
+    ForceTcp yes
+    Insecure yes
+"#,
+        port
+    );
+    fs::write(&ssh_config_path, ssh_conf).unwrap();
+
+    // Start server listening on that port with that knock
+    let child = Command::new(morshd_bin())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--stealth-knock")
+        .arg("/custom-ssh-alias-knock")
+        .arg("--no-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start morshd daemon");
+
+    let _guard = DaemonGuard { child };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Connect using alias name and -F ssh config file
+    let status = Command::new(morsh_bin())
+        .arg("-F")
+        .arg(&ssh_config_path)
+        .arg("--ping")
+        .arg("1")
+        .arg("my-ssh-alias")
+        .status()
+        .expect("Failed to run morsh with ssh config file alias");
+
+    assert!(status.success(), "Client SSH config alias and knock should connect successfully");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn test_remote_command_execution() {
     let port = get_free_port();
 

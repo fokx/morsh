@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod config;
-use config::{ClientConfig, OpenSshOptions};
+use config::{load_configs, OpenSshOptions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,7 +49,7 @@ struct Args {
     #[arg(short = 'i', long)]
     identity: Option<PathBuf>,
 
-    /// Path to alternative client configuration file (defaults to ~/.morsh/config.toml)
+    /// Path to alternative client configuration file (defaults to ~/.morsh/config.toml or ~/.ssh/config)
     #[arg(short = 'F', long = "config", value_name = "CONFIG")]
     config_file: Option<PathBuf>,
 
@@ -285,12 +285,16 @@ async fn main() -> Result<()> {
     };
 
     // Load configuration files and OpenSSH options
-    let client_cfg = ClientConfig::load(args.config_file.as_deref())?;
+    let (client_cfg, ssh_cfg) = load_configs(args.config_file.as_deref())?;
     let openssh_opts = OpenSshOptions::parse_options(&args.options)?;
     let initial_parsed = parse_destination(dest_str, args.port)?;
-    let matched_rule = client_cfg.match_host(&initial_parsed.host);
+    let morsh_matched = client_cfg.match_host(&initial_parsed.host);
+    let ssh_matched = ssh_cfg.match_host(&initial_parsed.host);
 
-    let target_host = matched_rule.host_name.unwrap_or(initial_parsed.host);
+    let target_host = morsh_matched
+        .host_name
+        .or(ssh_matched.host_name)
+        .unwrap_or(initial_parsed.host);
 
     let target_port = if let Some(p) = args.port {
         p
@@ -298,7 +302,9 @@ async fn main() -> Result<()> {
         p
     } else if dest_str.contains(':') && initial_parsed.port != 2222 {
         initial_parsed.port
-    } else if let Some(p) = matched_rule.port {
+    } else if let Some(p) = morsh_matched.port {
+        p
+    } else if let Some(p) = ssh_matched.port {
         p
     } else if let Some(p) = client_cfg.port {
         p
@@ -310,7 +316,9 @@ async fn main() -> Result<()> {
         Some(u.clone())
     } else if let Some(ref u) = openssh_opts.user {
         Some(u.clone())
-    } else if let Some(ref u) = matched_rule.user {
+    } else if let Some(ref u) = morsh_matched.user {
+        Some(u.clone())
+    } else if let Some(ref u) = ssh_matched.user {
         Some(u.clone())
     } else if let Some(ref u) = client_cfg.user {
         Some(u.clone())
@@ -320,19 +328,23 @@ async fn main() -> Result<()> {
 
     let target_identity = args.identity
         .or(openssh_opts.identity_file)
-        .or(matched_rule.identity_file)
+        .or(morsh_matched.identity_file)
+        .or(ssh_matched.identity_file)
         .or(client_cfg.identity_file);
 
     let effective_insecure = args.insecure
         || openssh_opts.strict_host_key_checking == Some(StrictHostKeyCheckingMode::No)
-        || matched_rule.insecure.unwrap_or(false)
+        || morsh_matched.insecure.unwrap_or(false)
+        || ssh_matched.insecure.unwrap_or(false)
         || client_cfg.insecure.unwrap_or(false);
 
     let effective_strict_host_key_checking = if effective_insecure {
         StrictHostKeyCheckingMode::No
     } else if let Some(mode) = openssh_opts.strict_host_key_checking {
         mode
-    } else if let Some(mode) = matched_rule.strict_host_key_checking {
+    } else if let Some(mode) = morsh_matched.strict_host_key_checking {
+        mode
+    } else if let Some(mode) = ssh_matched.strict_host_key_checking {
         mode
     } else if let Some(mode) = client_cfg.strict_host_key_checking {
         mode
@@ -342,24 +354,28 @@ async fn main() -> Result<()> {
 
     let effective_no_agent = args.no_agent
         || openssh_opts.forward_agent == Some(false)
-        || matched_rule.forward_agent == Some(false)
+        || morsh_matched.forward_agent == Some(false)
+        || ssh_matched.forward_agent == Some(false)
         || client_cfg.forward_agent == Some(false);
 
     let effective_stealth_knock = args.stealth_knock
         .or(openssh_opts.stealth_knock)
-        .or(matched_rule.stealth_knock)
+        .or(morsh_matched.stealth_knock)
+        .or(ssh_matched.stealth_knock)
         .or(client_cfg.stealth_knock);
 
     let effective_force_tcp = args.force_tcp
         || openssh_opts.force_tcp.unwrap_or(false)
-        || matched_rule.force_tcp.unwrap_or(false)
+        || morsh_matched.force_tcp.unwrap_or(false)
+        || ssh_matched.force_tcp.unwrap_or(false)
         || client_cfg.force_tcp.unwrap_or(false);
 
     let effective_tcp_timeout = if args.tcp_fallback_timeout != 300 {
         args.tcp_fallback_timeout
     } else {
         openssh_opts.tcp_fallback_timeout
-            .or(matched_rule.tcp_fallback_timeout)
+            .or(morsh_matched.tcp_fallback_timeout)
+            .or(ssh_matched.tcp_fallback_timeout)
             .or(client_cfg.tcp_fallback_timeout)
             .unwrap_or(300)
     };
@@ -368,7 +384,8 @@ async fn main() -> Result<()> {
         args.predict.clone()
     } else {
         openssh_opts.predict_mode
-            .or(matched_rule.predict_mode)
+            .or(morsh_matched.predict_mode)
+            .or(ssh_matched.predict_mode)
             .or(client_cfg.predict_mode)
             .unwrap_or_else(|| "auto".into())
     };
@@ -377,26 +394,31 @@ async fn main() -> Result<()> {
         args.predict_style.clone()
     } else {
         openssh_opts.predict_style
-            .or(matched_rule.predict_style)
+            .or(morsh_matched.predict_style)
+            .or(ssh_matched.predict_style)
             .or(client_cfg.predict_style)
             .unwrap_or_else(|| "underline".into())
     };
 
     let mut all_local_forwards = args.local_forward.clone();
     all_local_forwards.extend(openssh_opts.local_forward);
-    all_local_forwards.extend(matched_rule.local_forward);
+    all_local_forwards.extend(morsh_matched.local_forward);
+    all_local_forwards.extend(ssh_matched.local_forward);
 
     let mut all_remote_forwards = args.remote_forward.clone();
     all_remote_forwards.extend(openssh_opts.remote_forward);
-    all_remote_forwards.extend(matched_rule.remote_forward);
+    all_remote_forwards.extend(morsh_matched.remote_forward);
+    all_remote_forwards.extend(ssh_matched.remote_forward);
 
     let mut all_dynamic_forwards = args.dynamic_forward.clone();
     all_dynamic_forwards.extend(openssh_opts.dynamic_forward);
-    all_dynamic_forwards.extend(matched_rule.dynamic_forward);
+    all_dynamic_forwards.extend(morsh_matched.dynamic_forward);
+    all_dynamic_forwards.extend(ssh_matched.dynamic_forward);
 
     let mut all_udp_forwards = args.udp_forward.clone();
     all_udp_forwards.extend(openssh_opts.udp_forward);
-    all_udp_forwards.extend(matched_rule.udp_forward);
+    all_udp_forwards.extend(morsh_matched.udp_forward);
+    all_udp_forwards.extend(ssh_matched.udp_forward);
 
     let target = format!("{}:{}", target_host, target_port);
     let sni_name = args.server_name.unwrap_or_else(|| target_host.clone());
