@@ -44,7 +44,7 @@ pub struct PredictionEngine {
 
 impl Default for PredictionEngine {
     fn default() -> Self {
-        Self::new(PredictMode::Auto, PredictStyle::Underline)
+        Self::new(PredictMode::Never, PredictStyle::Underline)
     }
 }
 

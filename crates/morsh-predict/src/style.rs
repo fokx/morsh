@@ -65,13 +65,13 @@ impl FromStr for PredictStyle {
 /// Operational prediction mode for the client session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PredictMode {
-    /// Automatic prediction using latency, terminal modes, and confidence tracking. Default.
+    /// Completely disable speculative local echo. Default.
     #[default]
+    Never,
+    /// Automatic prediction using latency, terminal modes, and confidence tracking.
     Auto,
     /// Always speculatively echo printable characters (except in alternate screen buffer).
     Always,
-    /// Completely disable speculative local echo.
-    Never,
 }
 
 impl FromStr for PredictMode {

@@ -145,13 +145,13 @@ struct Args {
     #[arg(long, default_value = "0")]
     ping: u64,
 
-    /// Predictive local echo mode: auto, always, or never
-    #[arg(long, default_value = "auto", value_name = "MODE")]
-    predict: String,
+    /// Predictive local echo mode: never, auto, or always [default: never]
+    #[arg(long, value_name = "MODE")]
+    predict: Option<String>,
 
-    /// Predictive local echo visual style: underline, dim, or none
-    #[arg(long, default_value = "underline", value_name = "STYLE")]
-    predict_style: String,
+    /// Predictive local echo visual style: underline, dim, or none [default: underline]
+    #[arg(long, value_name = "STYLE")]
+    predict_style: Option<String>,
 }
 
 struct ParsedDestination {
@@ -380,25 +380,19 @@ async fn main() -> Result<()> {
             .unwrap_or(300)
     };
 
-    let effective_predict = if args.predict != "auto" {
-        args.predict.clone()
-    } else {
-        openssh_opts.predict_mode
-            .or(morsh_matched.predict_mode)
-            .or(ssh_matched.predict_mode)
-            .or(client_cfg.predict_mode)
-            .unwrap_or_else(|| "auto".into())
-    };
+    let effective_predict = args.predict
+        .or(openssh_opts.predict_mode)
+        .or(morsh_matched.predict_mode)
+        .or(ssh_matched.predict_mode)
+        .or(client_cfg.predict_mode)
+        .unwrap_or_else(|| "never".into());
 
-    let effective_predict_style = if args.predict_style != "underline" {
-        args.predict_style.clone()
-    } else {
-        openssh_opts.predict_style
-            .or(morsh_matched.predict_style)
-            .or(ssh_matched.predict_style)
-            .or(client_cfg.predict_style)
-            .unwrap_or_else(|| "underline".into())
-    };
+    let effective_predict_style = args.predict_style
+        .or(openssh_opts.predict_style)
+        .or(morsh_matched.predict_style)
+        .or(ssh_matched.predict_style)
+        .or(client_cfg.predict_style)
+        .unwrap_or_else(|| "underline".into());
 
     let mut all_local_forwards = args.local_forward.clone();
     all_local_forwards.extend(openssh_opts.local_forward);
@@ -961,8 +955,14 @@ async fn main() -> Result<()> {
 
         let predict_mode = effective_predict.parse::<morsh_predict::PredictMode>().unwrap_or_default();
         let predict_style = effective_predict_style.parse::<morsh_predict::PredictStyle>().unwrap_or_default();
-        let mut predict_engine = morsh_predict::PredictionEngine::new(predict_mode, predict_style);
-        predict_engine.set_rtt(conn.rtt());
+        let is_predict_active = predict_mode != morsh_predict::PredictMode::Never;
+        let mut predict_engine = if is_predict_active {
+            let mut pe = morsh_predict::PredictionEngine::new(predict_mode, predict_style);
+            pe.set_rtt(conn.rtt());
+            Some(pe)
+        } else {
+            None
+        };
 
         loop {
             tokio::select! {
@@ -970,10 +970,16 @@ async fn main() -> Result<()> {
                 out_res = pty_recv.read(&mut out_buf) => {
                     match out_res {
                         Ok(Some(n)) if n > 0 => {
-                            predict_engine.set_rtt(conn.rtt());
-                            let srv_res = predict_engine.process_server_output(&out_buf[..n]);
-                            if stdout.write_all(&srv_res.output_to_render).await.is_err() {
-                                break;
+                            if let Some(ref mut engine) = predict_engine {
+                                engine.set_rtt(conn.rtt());
+                                let srv_res = engine.process_server_output(&out_buf[..n]);
+                                if stdout.write_all(&srv_res.output_to_render).await.is_err() {
+                                    break;
+                                }
+                            } else {
+                                if stdout.write_all(&out_buf[..n]).await.is_err() {
+                                    break;
+                                }
                             }
                             let _ = stdout.flush().await;
                         }
@@ -1019,18 +1025,20 @@ async fn main() -> Result<()> {
 
                             if !write_bytes.is_empty() {
                                 if is_tty {
-                                    let input_res = predict_engine.process_input(&write_bytes);
-                                    if !input_res.speculative_render.is_empty() {
-                                        let _ = stdout.write_all(&input_res.speculative_render).await;
-                                        let _ = stdout.flush().await;
-                                    }
-                                    if let Some(seq) = input_res.highest_seq {
-                                        let _ = ctrl_tx
-                                            .send(ControlMessage::PredictInputSeq {
-                                                seq,
-                                                len: input_res.predictions.len() as u32,
-                                            })
-                                            .await;
+                                    if let Some(ref mut engine) = predict_engine {
+                                        let input_res = engine.process_input(&write_bytes);
+                                        if !input_res.speculative_render.is_empty() {
+                                            let _ = stdout.write_all(&input_res.speculative_render).await;
+                                            let _ = stdout.flush().await;
+                                        }
+                                        if let Some(seq) = input_res.highest_seq {
+                                            let _ = ctrl_tx
+                                                .send(ControlMessage::PredictInputSeq {
+                                                    seq,
+                                                    len: input_res.predictions.len() as u32,
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
 
@@ -1067,7 +1075,9 @@ async fn main() -> Result<()> {
                             break;
                         }
                         Ok(ControlMessage::PredictAck { ack_seq }) => {
-                            predict_engine.handle_ack(ack_seq);
+                            if let Some(ref mut engine) = predict_engine {
+                                engine.handle_ack(ack_seq);
+                            }
                         }
                         Ok(msg) => {
                             handle_client_control_msg(msg, &ctrl_tx, &tunnel_manager).await;
@@ -1080,10 +1090,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        let cleanup_bytes = predict_engine.reset();
-        if !cleanup_bytes.is_empty() {
-            let _ = stdout.write_all(&cleanup_bytes).await;
-            let _ = stdout.flush().await;
+        if let Some(mut engine) = predict_engine {
+            let cleanup_bytes = engine.reset();
+            if !cleanup_bytes.is_empty() {
+                let _ = stdout.write_all(&cleanup_bytes).await;
+                let _ = stdout.flush().await;
+            }
         }
 
         drop(_guard);

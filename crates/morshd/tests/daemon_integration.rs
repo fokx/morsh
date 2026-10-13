@@ -577,4 +577,135 @@ fn test_interactive_shell_auto_start_and_clean_exit() {
     }
 }
 
+#[test]
+fn test_interactive_shell_raw_input_no_manglings_or_prediction() {
+    let port = get_free_port();
+    let child = Command::new(morshd_bin())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--no-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start morshd daemon");
+
+    let _guard = DaemonGuard { child };
+    std::thread::sleep(Duration::from_millis(300));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let res = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(res, 0);
+
+        let slave_in = unsafe { std::fs::File::from_raw_fd(slave) };
+        let slave_out = slave_in.try_clone().unwrap();
+
+        let mut client = Command::new(morsh_bin())
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-k")
+            .arg("127.0.0.1")
+            .stdin(slave_in)
+            .stdout(slave_out)
+            .spawn()
+            .expect("Failed to spawn morsh client in PTY");
+
+        let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
+
+        // Wait for prompt
+        let mut total_output = Vec::new();
+        let mut buf = [0u8; 1024];
+        let start = std::time::Instant::now();
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        while start.elapsed() < Duration::from_secs(4) {
+            use std::io::Read;
+            match master_file.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    total_output.extend_from_slice(&buf[..n]);
+                    let out_str = String::from_utf8_lossy(&total_output);
+                    if out_str.contains('$') || out_str.contains('#') || out_str.contains('%') {
+                        break;
+                    }
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        // Test typing complex shell commands: 'apt update && apt upgrade'
+        use std::io::Write;
+        total_output.clear();
+        let _ = master_file.write_all(b"echo 'apt update && apt upgrade'\n");
+
+        let echo_start = std::time::Instant::now();
+        while echo_start.elapsed() < Duration::from_secs(3) {
+            use std::io::Read;
+            match master_file.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    total_output.extend_from_slice(&buf[..n]);
+                    let out_str = String::from_utf8_lossy(&total_output);
+                    if out_str.contains("apt update && apt upgrade") {
+                        break;
+                    }
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        let out_str = String::from_utf8_lossy(&total_output);
+        // Verify output contains the expected command echo
+        assert!(
+            out_str.contains("apt update && apt upgrade"),
+            "Command must be echoed cleanly! Got: {:?}",
+            out_str
+        );
+
+        // Verify there is NO predictive underline formatting (\x1b[4m)
+        assert!(
+            !total_output.windows(4).any(|w| w == b"\x1b[4m"),
+            "Speculative underline formatting must NOT be present when prediction is disabled by default!"
+        );
+
+        // Verify there are no duplicate manglings like "upddate" or "&&&&"
+        assert!(
+            !out_str.contains("upddate") && !out_str.contains("&&&&"),
+            "No character duplication should occur! Got: {:?}",
+            out_str
+        );
+
+        // Clean exit
+        let _ = master_file.write_all(b"exit\n");
+        let exit_start = std::time::Instant::now();
+        let mut client_exited = false;
+        while exit_start.elapsed() < Duration::from_secs(3) {
+            if let Ok(Some(status)) = client.try_wait() {
+                assert!(status.success());
+                client_exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(client_exited);
+        let _ = client.kill();
+    }
+}
+
 
