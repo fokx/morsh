@@ -9,10 +9,16 @@ pub struct QuicServer {
 }
 
 impl QuicServer {
-    /// Binds a QUIC server on the specified socket address with the given TLS / Quinn configuration.
+    /// Binds a QUIC server on the specified socket address with the given TLS / Quinn configuration and optimized socket buffers.
     pub fn bind(addr: SocketAddr, server_config: ServerConfig) -> Result<Self> {
-        let endpoint = Endpoint::server(server_config, addr)
-            .with_context(|| format!("Failed to bind QUIC server on {}", addr))?;
+        let socket = crate::connection::create_optimized_udp_socket(addr)?;
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            std::sync::Arc::new(quinn::TokioRuntime),
+        )
+        .with_context(|| format!("Failed to bind QUIC server on {}", addr))?;
 
         info!("QUIC server bound to {}", endpoint.local_addr()?);
         Ok(Self { endpoint })

@@ -9,11 +9,17 @@ pub struct QuicClient {
 }
 
 impl QuicClient {
-    /// Initializes a client endpoint bound to an ephemeral local port.
+    /// Initializes a client endpoint bound to an ephemeral local port with optimized socket buffers.
     pub fn new(client_config: ClientConfig) -> Result<Self> {
         let bind_addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
-        let mut endpoint = Endpoint::client(bind_addr)
-            .context("Failed to create client QUIC endpoint")?;
+        let socket = crate::connection::create_optimized_udp_socket(bind_addr)?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            std::sync::Arc::new(quinn::TokioRuntime),
+        )
+        .context("Failed to create client QUIC endpoint")?;
         endpoint.set_default_client_config(client_config);
         Ok(Self { endpoint })
     }

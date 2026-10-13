@@ -9,7 +9,7 @@ pub mod tcp_mux;
 pub mod tls;
 
 pub use client::QuicClient;
-pub use connection::{generate_session_id, MorshConnection};
+pub use connection::{create_optimized_udp_socket, generate_session_id, MorshConnection};
 pub use happy_eyeballs::{connect_happy_eyeballs, DEFAULT_FALLBACK_DELAY};
 pub use known_hosts::{
     default_known_hosts_path, KnownHostEntry, KnownHostStatus, KnownHosts,

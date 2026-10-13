@@ -207,6 +207,32 @@ pub fn generate_session_id() -> [u8; 16] {
     id
 }
 
+/// Creates an optimized non-blocking UDP socket with enlarged SO_RCVBUF and SO_SNDBUF (4MB)
+/// to eliminate kernel buffer packet drops on high-latency or lossy networks.
+pub fn create_optimized_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
+    use anyhow::Context;
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+        .context("Failed to create UDP socket")?;
+
+    if addr.is_ipv6() {
+        let _ = socket.set_only_v6(false);
+    }
+
+    // Set SO_RCVBUF and SO_SNDBUF to 4MB to prevent kernel buffer drops on high-latency/lossy networks
+    let _ = socket.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = socket.set_nonblocking(true);
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("Failed to bind UDP socket on {}", addr))?;
+    Ok(socket.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

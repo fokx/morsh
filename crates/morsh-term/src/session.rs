@@ -51,16 +51,18 @@ impl PersistentSession {
         // and broadcasts live output to any attached client.
         tokio::spawn(async move {
             while let Some(chunk) = reader.read_chunk().await {
-                // 1. Process output into vt100 virtual terminal state buffer
-                if let Ok(mut buf) = buffer_for_reader.lock() {
-                    buf.process(&chunk);
-                }
-
-                // 2. Forward to currently attached client if present
-                if let Some(ref tx) = *attached_tx_for_reader.lock().await {
-                    if tx.send(chunk).await.is_err() {
+                // 1. Forward immediately to currently attached client if present
+                let client_tx = attached_tx_for_reader.lock().await.clone();
+                if let Some(tx) = client_tx {
+                    let res = tx.send(chunk.clone()).await;
+                    if res.is_err() {
                         debug!("Attached client receiver dropped");
                     }
+                }
+
+                // 2. Process output into vt100 virtual terminal state buffer for snapshot recovery
+                if let Ok(mut buf) = buffer_for_reader.lock() {
+                    buf.process(&chunk);
                 }
             }
 

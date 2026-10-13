@@ -284,7 +284,7 @@ impl TunnelStreamPreamble {
     }
 
     pub fn from_bytes(bytes: &[u8; 8]) -> Option<Self> {
-        if &bytes[0..4] != &TUNNEL_STREAM_MAGIC {
+        if bytes[0..4] != TUNNEL_STREAM_MAGIC {
             return None;
         }
         let tunnel_id = u32::from_be_bytes(bytes[4..8].try_into().ok()?);

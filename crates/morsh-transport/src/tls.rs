@@ -75,10 +75,15 @@ pub fn make_server_config_from_rustls(
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(quic_server_config));
 
-    // Enable connection migration and sensible transport defaults
+    // Enable connection migration and high-performance transport defaults
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
+    transport.stream_receive_window((4 * 1024 * 1024u32).into());
+    transport.receive_window((8 * 1024 * 1024u32).into());
+    transport.send_window(4 * 1024 * 1024);
     server_config.transport_config(Arc::new(transport));
 
     Ok(server_config)
@@ -213,6 +218,11 @@ pub fn make_client_config_from_rustls(
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
+    transport.stream_receive_window((4 * 1024 * 1024u32).into());
+    transport.receive_window((8 * 1024 * 1024u32).into());
+    transport.send_window(4 * 1024 * 1024);
     client_config.transport_config(Arc::new(transport));
 
     Ok(client_config)

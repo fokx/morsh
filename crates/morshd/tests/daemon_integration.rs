@@ -708,4 +708,240 @@ fn test_interactive_shell_raw_input_no_manglings_or_prediction() {
     }
 }
 
+#[test]
+fn test_interactive_shell_bulk_output_and_ctrl_c_responsiveness() {
+    let port = get_free_port();
+    let child = Command::new(morshd_bin())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--no-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start morshd daemon");
+
+    let _guard = DaemonGuard { child };
+    std::thread::sleep(Duration::from_millis(300));
+
+    #[cfg(unix)]
+    {
+        use std::io::{Read, Write};
+        use std::os::unix::io::FromRawFd;
+
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let res = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(res, 0);
+
+        let slave_in = unsafe { std::fs::File::from_raw_fd(slave) };
+        let slave_out = slave_in.try_clone().unwrap();
+
+        let mut client = Command::new(morsh_bin())
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-k")
+            .arg("127.0.0.1")
+            .stdin(slave_in)
+            .stdout(slave_out)
+            .spawn()
+            .expect("Failed to spawn morsh client in PTY");
+
+        let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
+
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Wait for shell prompt
+        let mut total_output = Vec::new();
+        let mut buf = [0u8; 65536];
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(4) {
+            match master_file.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    total_output.extend_from_slice(&buf[..n]);
+                    let out_str = String::from_utf8_lossy(&total_output);
+                    if out_str.contains('$') || out_str.contains('#') || out_str.contains('%') {
+                        break;
+                    }
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        // Run a fast continuous output command (simulating flood like dmesg -w or while true)
+        let _ = master_file.write_all(b"python3 -c \"import time; i=0\nwhile True:\n    print(f'[ {i} ] kernel log simulation 1234567890')\n    i += 1\"\n");
+
+        // Let output stream for 200ms
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Read streaming chunks
+        let mut streamed_bytes = 0;
+        while let Ok(n) = master_file.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            streamed_bytes += n;
+        }
+        assert!(streamed_bytes > 0, "Expected data to have streamed from background loop");
+
+        // Send Ctrl+C (0x03)
+        let ctrl_c_time = std::time::Instant::now();
+        let _ = master_file.write_all(b"\x03");
+
+        // Verify that the output stops quickly after Ctrl+C and does not lag indefinitely
+        let mut stopped = false;
+        let mut last_read_time = std::time::Instant::now();
+        while ctrl_c_time.elapsed() < Duration::from_secs(4) {
+            match master_file.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    last_read_time = std::time::Instant::now();
+                }
+                _ => {
+                    if last_read_time.elapsed() > Duration::from_millis(400) {
+                        stopped = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+        }
+
+        assert!(stopped, "Terminal output must stop promptly after sending Ctrl+C!");
+
+        // Clean exit
+        let _ = master_file.write_all(b"exit\n");
+        let exit_start = std::time::Instant::now();
+        let mut client_exited = false;
+        while exit_start.elapsed() < Duration::from_secs(3) {
+            if let Ok(Some(status)) = client.try_wait() {
+                assert!(status.success());
+                client_exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(client_exited);
+        let _ = client.kill();
+    }
+}
+
+#[test]
+fn test_interactive_shell_ssh_escape_tilde_dot() {
+    let port = get_free_port();
+    let child = Command::new(morshd_bin())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--no-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start morshd daemon");
+
+    let _guard = DaemonGuard { child };
+    std::thread::sleep(Duration::from_millis(300));
+
+    #[cfg(unix)]
+    {
+        use std::io::{Read, Write};
+        use std::os::unix::io::FromRawFd;
+
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let res = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(res, 0);
+
+        let slave_in = unsafe { std::fs::File::from_raw_fd(slave) };
+        let slave_out = slave_in.try_clone().unwrap();
+
+        let mut client = Command::new(morsh_bin())
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-k")
+            .arg("127.0.0.1")
+            .stdin(slave_in)
+            .stdout(slave_out)
+            .spawn()
+            .expect("Failed to spawn morsh client in PTY");
+
+        let mut master_file = unsafe { std::fs::File::from_raw_fd(master) };
+
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Wait for shell prompt
+        let mut total_output = Vec::new();
+        let mut buf = [0u8; 4096];
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(4) {
+            match master_file.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    total_output.extend_from_slice(&buf[..n]);
+                    let out_str = String::from_utf8_lossy(&total_output);
+                    if out_str.contains('$') || out_str.contains('#') || out_str.contains('%') {
+                        break;
+                    }
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        // Type Enter then ~. (classic OpenSSH disconnect escape sequence)
+        let _ = master_file.write_all(b"\r~.");
+
+        // Client should cleanly detach/terminate
+        let exit_start = std::time::Instant::now();
+        let mut client_exited = false;
+        while exit_start.elapsed() < Duration::from_secs(4) {
+            if let Ok(Some(status)) = client.try_wait() {
+                assert!(status.success());
+                client_exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(client_exited, "morsh client must exit when ~. escape is typed!");
+
+        // Drain any remaining output and verify detached message
+        while let Ok(n) = master_file.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total_output.extend_from_slice(&buf[..n]);
+        }
+        let out_str = String::from_utf8_lossy(&total_output);
+        assert!(
+            out_str.contains("detached session"),
+            "Expected detached session notification in output: {:?}",
+            out_str
+        );
+
+        let _ = client.kill();
+    }
+}
+
 

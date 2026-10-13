@@ -595,7 +595,7 @@ async fn handle_connection(
                     }
                 };
 
-                let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
                 session.attach(client_tx).await;
 
                 if !initial_input.is_empty() {
@@ -606,6 +606,9 @@ async fn handle_connection(
                     while let Some(chunk) = client_rx.recv().await {
                         if pty_send.write_all(&chunk).await.is_err() {
                             break;
+                        }
+                        if client_rx.is_empty() {
+                            let _ = pty_send.flush().await;
                         }
                     }
                     let _ = pty_send.finish();

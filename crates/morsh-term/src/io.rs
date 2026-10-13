@@ -16,12 +16,12 @@ pub struct AsyncPtyReader {
 impl AsyncPtyReader {
     /// Creates a new AsyncPtyReader backed by a dedicated blocking reader thread.
     pub fn new(mut reader: Box<dyn Read + Send>) -> Self {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(4);
 
         thread::Builder::new()
             .name("morsh-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; 65536];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {

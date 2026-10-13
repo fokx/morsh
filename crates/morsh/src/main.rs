@@ -948,8 +948,10 @@ async fn main() -> Result<()> {
                 .context("Failed to register SIGWINCH listener")?;
 
         let mut in_buf = [0u8; 4096];
-        let mut out_buf = [0u8; 4096];
+        let mut out_buf = [0u8; 65536];
         let mut stdin_eof = false;
+        let mut at_line_start = true;
+        let mut saw_ssh_escape = false;
         let mut saw_detach_prefix = false;
         let mut detached_by_user = false;
 
@@ -966,31 +968,9 @@ async fn main() -> Result<()> {
 
         loop {
             tokio::select! {
-                // Remote PTY stdout -> local stdout
-                out_res = pty_recv.read(&mut out_buf) => {
-                    match out_res {
-                        Ok(Some(n)) if n > 0 => {
-                            if let Some(ref mut engine) = predict_engine {
-                                engine.set_rtt(conn.rtt());
-                                let srv_res = engine.process_server_output(&out_buf[..n]);
-                                if stdout.write_all(&srv_res.output_to_render).await.is_err() {
-                                    break;
-                                }
-                            } else {
-                                if stdout.write_all(&out_buf[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                            let _ = stdout.flush().await;
-                        }
-                        _ => {
-                            debug!("Remote PTY closed output (EOF)");
-                            break;
-                        }
-                    }
-                }
+                biased;
 
-                // Local stdin -> remote PTY stdin (with Ctrl-^ d escape detection and speculative echo)
+                // Local stdin -> remote PTY stdin (HIGHEST PRIORITY for interactive responsiveness & Ctrl+C)
                 in_res = stdin.read(&mut in_buf), if !stdin_eof => {
                     match in_res {
                         Ok(n) if n > 0 => {
@@ -998,7 +978,20 @@ async fn main() -> Result<()> {
                             let mut detach_triggered = false;
 
                             for &b in &in_buf[..n] {
-                                if saw_detach_prefix {
+                                if saw_ssh_escape {
+                                    saw_ssh_escape = false;
+                                    if b == b'.' {
+                                        detach_triggered = true;
+                                        break;
+                                    } else if b == b'~' {
+                                        write_bytes.push(b'~');
+                                        at_line_start = false;
+                                    } else {
+                                        write_bytes.push(b'~');
+                                        write_bytes.push(b);
+                                        at_line_start = b == b'\r' || b == b'\n';
+                                    }
+                                } else if saw_detach_prefix {
                                     saw_detach_prefix = false;
                                     if b == b'd' || b == b'D' || b == b'.' {
                                         detach_triggered = true;
@@ -1008,17 +1001,21 @@ async fn main() -> Result<()> {
                                     } else {
                                         write_bytes.push(0x1e);
                                         write_bytes.push(b);
+                                        at_line_start = b == b'\r' || b == b'\n';
                                     }
+                                } else if at_line_start && b == b'~' {
+                                    saw_ssh_escape = true;
                                 } else if b == 0x1e {
                                     saw_detach_prefix = true;
                                 } else {
+                                    at_line_start = b == b'\r' || b == b'\n';
                                     write_bytes.push(b);
                                 }
                             }
 
                             if detach_triggered {
                                 detached_by_user = true;
-                                debug!("User triggered session detach escape sequence (Ctrl-^ d)");
+                                debug!("User triggered session detach escape sequence (~. or Ctrl-^ d)");
                                 let _ = ctrl_tx.send(ControlMessage::SessionDetachRequest).await;
                                 break;
                             }
@@ -1044,6 +1041,8 @@ async fn main() -> Result<()> {
 
                                 if pty_send.write_all(&write_bytes).await.is_err() {
                                     stdin_eof = true;
+                                } else {
+                                    let _ = pty_send.flush().await;
                                 }
                             }
                         }
@@ -1083,6 +1082,30 @@ async fn main() -> Result<()> {
                             handle_client_control_msg(msg, &ctrl_tx, &tunnel_manager).await;
                         }
                         Err(_) => {
+                            break;
+                        }
+                    }
+                }
+
+                // Remote PTY stdout -> local stdout
+                out_res = pty_recv.read(&mut out_buf) => {
+                    match out_res {
+                        Ok(Some(n)) if n > 0 => {
+                            if let Some(ref mut engine) = predict_engine {
+                                engine.set_rtt(conn.rtt());
+                                let srv_res = engine.process_server_output(&out_buf[..n]);
+                                if stdout.write_all(&srv_res.output_to_render).await.is_err() {
+                                    break;
+                                }
+                            } else {
+                                if stdout.write_all(&out_buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let _ = stdout.flush().await;
+                        }
+                        _ => {
+                            debug!("Remote PTY closed output (EOF)");
                             break;
                         }
                     }
