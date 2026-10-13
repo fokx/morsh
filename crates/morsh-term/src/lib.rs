@@ -22,7 +22,7 @@ pub use session::{PersistentSession, SessionRegistry};
 pub use user::UserInfo;
 
 pub fn term_subsystem_version() -> &'static str {
-    "0.3.0"
+    "0.4.0"
 }
 
 #[cfg(test)]
