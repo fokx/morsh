@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
 
@@ -515,17 +516,17 @@ async fn main() -> Result<()> {
             supported_auth,
             session_resumed,
         } => {
-            println!("========================================================");
-            println!(" Connected to morshd server!");
-            println!("   Server Software : {}", server_software);
-            println!("   Protocol Version: v{}", version);
-            println!("   Transport       : {}", conn.transport_name());
-            println!("   Session ID      : {}", hex_encode(&session_id));
-            println!("   Resumption Token: {}", hex_encode(&resumption_token));
-            println!("   Session Resumed : {}", session_resumed);
-            println!("   Auth Supported  : {:?}", supported_auth);
-            println!("   Round-Trip Time : {:.2} ms", conn.rtt().as_secs_f64() * 1000.0);
-            println!("========================================================");
+            eprintln!("========================================================");
+            eprintln!(" Connected to morshd server!");
+            eprintln!("   Server Software : {}", server_software);
+            eprintln!("   Protocol Version: v{}", version);
+            eprintln!("   Transport       : {}", conn.transport_name());
+            eprintln!("   Session ID      : {}", hex_encode(&session_id));
+            eprintln!("   Resumption Token: {}", hex_encode(&resumption_token));
+            eprintln!("   Session Resumed : {}", session_resumed);
+            eprintln!("   Auth Supported  : {:?}", supported_auth);
+            eprintln!("   Round-Trip Time : {:.2} ms", conn.rtt().as_secs_f64() * 1000.0);
+            eprintln!("========================================================");
             (session_id, resumption_token, supported_auth)
         }
         ControlMessage::Disconnect { reason_code, message } => {
@@ -632,7 +633,7 @@ async fn main() -> Result<()> {
 
         match result_msg {
             ControlMessage::AuthResult { success: true, message } => {
-                println!(">> Authentication Successful: {}", message);
+                eprintln!(">> Authentication Successful: {}", message);
             }
             ControlMessage::AuthResult { success: false, message } => {
                 eprintln!(">> Authentication FAILED: {}", message);
