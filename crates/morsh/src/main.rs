@@ -225,10 +225,33 @@ fn save_session_token(session_id: &[u8; 16], token: &[u8; 16], destination: &str
     if let Some(path) = get_session_cache_path(&id_hex) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         let content = format!("{}\n{}\n", token_hex, destination);
-        let _ = std::fs::write(&path, content);
+        let _ = write_private_file(&path, content.as_bytes());
     }
+}
+
+/// Writes a file readable only by the owner (0600 on Unix), since it holds a secret token.
+fn write_private_file(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(content)
+}
+
+fn creates_resumable_session(args: &Args) -> bool {
+    args.command.is_empty() && !args.list_sessions && !args.no_shell && args.resume.is_none()
 }
 
 fn load_session_token(session_id_hex: &str) -> Option<[u8; 16]> {
@@ -248,6 +271,7 @@ fn current_timestamp_ms() -> u64 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let cache_session_token = creates_resumable_session(&args);
 
     if let Some(shell) = args.completions {
         let mut cmd = Args::command();
@@ -646,8 +670,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Cache session token for future resumption
-    save_session_token(&session_id, &resumption_token, dest_str);
+    // Cache session token for future resumption. Only a new interactive shell
+    // produces a session worth resuming: exec commands end with the command,
+    // --list-sessions and -N never spawn a PTY, and --resume attaches to an
+    // existing session (whose token is already cached) instead of this new ID.
+    if cache_session_token {
+        save_session_token(&session_id, &resumption_token, dest_str);
+    }
 
     // If client requested --list-sessions, query server and exit immediately
     if args.list_sessions {
@@ -1337,5 +1366,29 @@ mod tests {
         assert_eq!(args.verbose, 2);
         assert_eq!(args.options.len(), 2);
         assert_eq!(args.command, vec!["ls".to_string(), "-la".to_string()]);
+    }
+
+    #[test]
+    fn test_session_token_cached_only_for_interactive_shell() {
+        let parse = |argv: &[&str]| Args::try_parse_from(argv).unwrap();
+        assert!(creates_resumable_session(&parse(&["morsh", "host"])));
+        assert!(!creates_resumable_session(&parse(&["morsh", "host", "ls"])));
+        assert!(!creates_resumable_session(&parse(&["morsh", "-N", "host"])));
+        assert!(!creates_resumable_session(&parse(&["morsh", "--list-sessions", "host"])));
+        assert!(!creates_resumable_session(&parse(&[
+            "morsh", "host", "--resume", "00112233445566778899aabbccddeeff",
+        ])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_private_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("morsh-private-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write_private_file(&path, b"secret\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
     }
 }
