@@ -944,4 +944,92 @@ fn test_interactive_shell_ssh_escape_tilde_dot() {
     }
 }
 
+/// Counts zombie (state Z) children of `ppid` by scanning /proc.
+#[cfg(target_os = "linux")]
+fn count_zombie_children(ppid: u32) -> usize {
+    let mut count = 0;
+    let entries = match fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Format: pid (comm) state ppid ... — comm may contain spaces or
+        // parentheses, so parse the fields after the last ')'.
+        if let Some(close) = stat.rfind(')') {
+            let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            if rest.len() >= 2 && rest[0] == "Z" && rest[1] == ppid.to_string() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
 
+/// Regression test: finished exec sessions must not leave zombie children
+/// behind in the daemon. Each unreaped child keeps holding a PID/task slot,
+/// so one zombie per exec eventually exhausts the process limit; from that
+/// point new PTY child spawns fail while the (fork-free) control plane —
+/// auth, session list — keeps working.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_exec_sessions_do_not_leave_zombie_children() {
+    let port = get_free_port();
+
+    let child = Command::new(morshd_bin())
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{}", port))
+        .arg("--no-auth")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("Failed to start morshd daemon");
+
+    let daemon_pid = child.id();
+    let _guard = DaemonGuard { child };
+    std::thread::sleep(Duration::from_millis(300));
+
+    for i in 0..3 {
+        let out = Command::new(morsh_bin())
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("-k")
+            .arg("127.0.0.1")
+            .arg("echo")
+            .arg(format!("ZOMBIE_CHECK_{}", i))
+            .stdin(Stdio::null())
+            .output()
+            .expect("Failed to execute remote command via morsh");
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("ZOMBIE_CHECK_{}", i)),
+            "exec {} should return its output",
+            i
+        );
+    }
+
+    // A finished session's child is reaped either when its connection tears
+    // down or by the daemon's 30-second reaper cycle; allow both paths time
+    // to run, then require that no zombies remain.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let zombies = count_zombie_children(daemon_pid);
+        if zombies == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon still has {} zombie children after exec sessions finished",
+            zombies
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
