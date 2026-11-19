@@ -118,7 +118,14 @@ impl PersistentSession {
 
     /// Whether the underlying shell/process has terminated.
     pub fn has_exited(&self) -> bool {
-        self.exited.load(Ordering::SeqCst) || self.handle.try_wait().ok().flatten().is_some()
+        // Poll the child first so that a terminated process is always
+        // reaped (waitpid). Checking the EOF flag first would
+        // short-circuit this call: the background reader sets `exited`
+        // as soon as the PTY reaches EOF — exactly when the child has
+        // terminated — and the child would then never be waited on,
+        // leaving one zombie process behind for every finished session.
+        let child_exited = self.handle.try_wait().ok().flatten().is_some();
+        child_exited || self.exited.load(Ordering::SeqCst)
     }
 
     /// Whether a client is currently attached.
@@ -438,5 +445,73 @@ mod tests {
         assert_eq!(registry.count().await, 0);
 
         let _ = session.kill();
+    }
+
+    /// Regression test: a session whose child has exited must reap it.
+    ///
+    /// The background reader task sets the `exited` flag as soon as the PTY
+    /// reaches EOF — exactly when the child terminates. `has_exited()` used
+    /// to check that flag first and short-circuit the `try_wait()` call, so
+    /// the child was never waited on and stayed behind as a zombie process
+    /// of the parent, once per finished session.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_has_exited_reaps_child_process() {
+        let session_id = [42u8; 16];
+        let token = [43u8; 16];
+
+        let mut config = PtyConfig::default();
+        config.command = Some(vec!["/bin/sh".into(), "-c".into(), "echo REAP_ME".into()]);
+
+        let session =
+            PersistentSession::spawn(session_id, token, "test_user".into(), &config).unwrap();
+        let pid = session
+            .handle()
+            .process_id()
+            .expect("session child should have a pid") as libc::pid_t;
+
+        // Wait until the child has exited but is still unreaped (a zombie):
+        // /proc/<pid>/stat shows state 'Z' in that window.
+        let stat_path = format!("/proc/{}/stat", pid);
+        let mut is_zombie = false;
+        for _ in 0..100 {
+            if let Ok(stat) = std::fs::read_to_string(&stat_path) {
+                // Format: pid (comm) state ... — comm may contain spaces or
+                // parentheses, so parse the fields after the last ')'.
+                if let Some(close) = stat.rfind(')') {
+                    let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+                    if rest.first() == Some(&"Z") {
+                        is_zombie = true;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            is_zombie,
+            "child {} should have exited and become a zombie",
+            pid
+        );
+
+        // Give the background reader task time to observe PTY EOF and set the
+        // session's exited flag — the production ordering in which the reap
+        // used to be skipped.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(session.has_exited(), "session should report exited");
+
+        // has_exited() must have reaped the child: a raw waitpid from this
+        // process now reports ECHILD (no such child) instead of returning
+        // the pid of a still-unreaped zombie.
+        let mut status: libc::c_int = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(
+            rc, -1,
+            "child {} was still unreaped after has_exited(); waitpid returned {}",
+            pid, rc
+        );
+        assert_eq!(errno, Some(libc::ECHILD));
     }
 }
